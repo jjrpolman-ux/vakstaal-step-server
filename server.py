@@ -6,15 +6,22 @@ import time
 import uuid
 import json
 import math
+import sqlite3
+from datetime import datetime, timezone
 
 import numpy as np
 from pathlib import Path
 
 import cadquery as cq
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from step_analyzer import analyze_step, _dominant_longitudinal_axis_and_length
+
+try:
+    import psycopg
+except Exception:
+    psycopg = None
 
 BASE = Path(__file__).resolve().parent
 CACHE_DIR = Path(os.environ.get("STEP_CACHE_DIR", "/tmp/vakstaal_step_cache"))
@@ -721,6 +728,508 @@ def job_step_path(job_id: str) -> Path:
     return candidates[0]
 
 
+
+# ============================================================================
+# OFFERTE DATABASE + STEP/NEST BESTANDEN
+# ============================================================================
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+QUOTE_DB_PATH = Path(os.environ.get("QUOTE_DB_PATH", "/tmp/vakstaal_quotes.sqlite3"))
+MAX_QUOTE_FILE_MB = int(os.environ.get("MAX_QUOTE_FILE_MB", "100"))
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _postgres_enabled() -> bool:
+    return bool(DATABASE_URL and psycopg is not None)
+
+
+def _db_connect():
+    if _postgres_enabled():
+        return psycopg.connect(DATABASE_URL)
+
+    # Alleen fallback/test. Voor productie gebruiken we jouw Render PostgreSQL.
+    QUOTE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(QUOTE_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _sql(postgres_sql: str, sqlite_sql: str) -> str:
+    return postgres_sql if _postgres_enabled() else sqlite_sql
+
+
+def _row_to_dict(row, cursor=None):
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    if isinstance(row, dict):
+        return row
+    if cursor is not None and cursor.description:
+        names = []
+        for col in cursor.description:
+            names.append(col.name if hasattr(col, "name") else col[0])
+        return {names[i]: row[i] for i in range(len(row))}
+    return row
+
+
+def _init_quote_db() -> None:
+    with _db_connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            _sql(
+                """
+                CREATE TABLE IF NOT EXISTS quotes (
+                    id TEXT PRIMARY KEY,
+                    quote_number TEXT UNIQUE NOT NULL,
+                    customer_name TEXT NOT NULL,
+                    contact_person TEXT,
+                    customer_email TEXT,
+                    customer_phone TEXT,
+                    total_ex_vat DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS quotes (
+                    id TEXT PRIMARY KEY,
+                    quote_number TEXT UNIQUE NOT NULL,
+                    customer_name TEXT NOT NULL,
+                    contact_person TEXT,
+                    customer_email TEXT,
+                    customer_phone TEXT,
+                    total_ex_vat REAL NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+        )
+
+        cur.execute(
+            _sql(
+                """
+                CREATE TABLE IF NOT EXISTS quote_files (
+                    id TEXT PRIMARY KEY,
+                    quote_id TEXT NOT NULL REFERENCES quotes(id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL,
+                    content_type TEXT,
+                    file_kind TEXT,
+                    file_size BIGINT NOT NULL,
+                    data BYTEA NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS quote_files (
+                    id TEXT PRIMARY KEY,
+                    quote_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    content_type TEXT,
+                    file_kind TEXT,
+                    file_size INTEGER NOT NULL,
+                    data BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(quote_id) REFERENCES quotes(id) ON DELETE CASCADE
+                )
+                """
+            )
+        )
+
+        conn.commit()
+
+
+def _file_kind(filename: str) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in {".step", ".stp"}:
+        return "STEP"
+    if suffix in {".zx", ".nest"}:
+        return "ZX/Nest"
+    return "Bestand"
+
+
+def _next_quote_number(conn) -> str:
+    year = datetime.now().year
+    prefix = f"VAK-{year}-"
+    cur = conn.cursor()
+
+    cur.execute(
+        _sql(
+            "SELECT quote_number FROM quotes WHERE quote_number LIKE %s ORDER BY quote_number DESC LIMIT 1",
+            "SELECT quote_number FROM quotes WHERE quote_number LIKE ? ORDER BY quote_number DESC LIMIT 1"
+        ),
+        (prefix + "%",)
+    )
+
+    row = cur.fetchone()
+    last = 0
+
+    if row:
+        value = row[0] if not isinstance(row, sqlite3.Row) else row["quote_number"]
+        try:
+            last = int(str(value).rsplit("-", 1)[-1])
+        except Exception:
+            last = 0
+
+    return f"{prefix}{last + 1:04d}"
+
+
+def _quote_files(conn, quote_id: str) -> list[dict]:
+    cur = conn.cursor()
+    cur.execute(
+        _sql(
+            """
+            SELECT id, filename, content_type, file_kind, file_size, created_at
+            FROM quote_files
+            WHERE quote_id=%s
+            ORDER BY created_at
+            """,
+            """
+            SELECT id, filename, content_type, file_kind, file_size, created_at
+            FROM quote_files
+            WHERE quote_id=?
+            ORDER BY created_at
+            """
+        ),
+        (quote_id,)
+    )
+
+    return [_row_to_dict(r, cur) for r in cur.fetchall()]
+
+
+async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> None:
+    for upload in files or []:
+        filename = upload.filename or "bestand"
+        data = await upload.read()
+
+        if not data:
+            continue
+
+        if len(data) > MAX_QUOTE_FILE_MB * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{filename} is groter dan {MAX_QUOTE_FILE_MB} MB."
+            )
+
+        # Voorkom een tweede identieke kopie bij opnieuw opslaan.
+        cur = conn.cursor()
+        cur.execute(
+            _sql(
+                """
+                SELECT id FROM quote_files
+                WHERE quote_id=%s AND filename=%s AND file_size=%s
+                LIMIT 1
+                """,
+                """
+                SELECT id FROM quote_files
+                WHERE quote_id=? AND filename=? AND file_size=?
+                LIMIT 1
+                """
+            ),
+            (quote_id, filename, len(data))
+        )
+
+        if cur.fetchone():
+            continue
+
+        file_id = uuid.uuid4().hex
+
+        cur.execute(
+            _sql(
+                """
+                INSERT INTO quote_files
+                (id, quote_id, filename, content_type, file_kind, file_size, data, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                """
+                INSERT INTO quote_files
+                (id, quote_id, filename, content_type, file_kind, file_size, data, created_at)
+                VALUES (?,?,?,?,?,?,?,?)
+                """
+            ),
+            (
+                file_id,
+                quote_id,
+                filename,
+                upload.content_type or "application/octet-stream",
+                _file_kind(filename),
+                len(data),
+                data,
+                _utcnow(),
+            )
+        )
+
+
+def _quote_response(conn, quote_id: str) -> dict:
+    cur = conn.cursor()
+    cur.execute(
+        _sql(
+            """
+            SELECT id, quote_number, customer_name, contact_person, customer_email,
+                   customer_phone, total_ex_vat, payload_json, created_at, updated_at
+            FROM quotes
+            WHERE id=%s
+            """,
+            """
+            SELECT id, quote_number, customer_name, contact_person, customer_email,
+                   customer_phone, total_ex_vat, payload_json, created_at, updated_at
+            FROM quotes
+            WHERE id=?
+            """
+        ),
+        (quote_id,)
+    )
+
+    row = _row_to_dict(cur.fetchone(), cur)
+    if not row:
+        raise HTTPException(status_code=404, detail="Offerte niet gevonden.")
+
+    try:
+        row["payload"] = json.loads(row.pop("payload_json"))
+    except Exception:
+        row["payload"] = {}
+        row.pop("payload_json", None)
+
+    row["files"] = _quote_files(conn, quote_id)
+    return row
+
+
+_init_quote_db()
+
+
+@app.get("/api/quotes")
+def list_quotes():
+    with _db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, quote_number, customer_name, contact_person, customer_email,
+                   customer_phone, total_ex_vat, created_at, updated_at
+            FROM quotes
+            ORDER BY updated_at DESC
+            """
+        )
+
+        rows = [_row_to_dict(r, cur) for r in cur.fetchall()]
+        for row in rows:
+            row["files"] = _quote_files(conn, row["id"])
+
+        return {
+            "ok": True,
+            "database": "postgresql" if _postgres_enabled() else "sqlite",
+            "quotes": rows,
+        }
+
+
+@app.get("/api/quotes/{quote_id}")
+def get_quote(quote_id: str):
+    with _db_connect() as conn:
+        return _quote_response(conn, quote_id)
+
+
+@app.post("/api/quotes")
+async def create_quote(
+    payload: str = Form(...),
+    files: list[UploadFile] = File(default=[]),
+):
+    try:
+        data = json.loads(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Ongeldige offertegegevens.") from exc
+
+    customer_name = str(data.get("customer") or "").strip()
+    if not customer_name:
+        raise HTTPException(status_code=400, detail="Klantnaam ontbreekt.")
+
+    quote_id = uuid.uuid4().hex
+    now = _utcnow()
+
+    with _db_connect() as conn:
+        quote_number = _next_quote_number(conn)
+        cur = conn.cursor()
+
+        cur.execute(
+            _sql(
+                """
+                INSERT INTO quotes
+                (id, quote_number, customer_name, contact_person, customer_email,
+                 customer_phone, total_ex_vat, payload_json, created_at, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                """
+                INSERT INTO quotes
+                (id, quote_number, customer_name, contact_person, customer_email,
+                 customer_phone, total_ex_vat, payload_json, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                """
+            ),
+            (
+                quote_id,
+                quote_number,
+                customer_name,
+                str(data.get("contactPerson") or ""),
+                str(data.get("customerEmail") or ""),
+                str(data.get("customerPhone") or ""),
+                float(data.get("total_ex_vat") or 0),
+                json.dumps(data, ensure_ascii=False),
+                now,
+                now,
+            )
+        )
+
+        await _store_quote_files(conn, quote_id, files)
+        conn.commit()
+
+        return _quote_response(conn, quote_id)
+
+
+@app.put("/api/quotes/{quote_id}")
+async def update_quote(
+    quote_id: str,
+    payload: str = Form(...),
+    files: list[UploadFile] = File(default=[]),
+):
+    try:
+        data = json.loads(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Ongeldige offertegegevens.") from exc
+
+    customer_name = str(data.get("customer") or "").strip()
+    if not customer_name:
+        raise HTTPException(status_code=400, detail="Klantnaam ontbreekt.")
+
+    with _db_connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            _sql(
+                "SELECT id FROM quotes WHERE id=%s",
+                "SELECT id FROM quotes WHERE id=?"
+            ),
+            (quote_id,)
+        )
+
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Offerte niet gevonden.")
+
+        cur.execute(
+            _sql(
+                """
+                UPDATE quotes
+                SET customer_name=%s,
+                    contact_person=%s,
+                    customer_email=%s,
+                    customer_phone=%s,
+                    total_ex_vat=%s,
+                    payload_json=%s,
+                    updated_at=%s
+                WHERE id=%s
+                """,
+                """
+                UPDATE quotes
+                SET customer_name=?,
+                    contact_person=?,
+                    customer_email=?,
+                    customer_phone=?,
+                    total_ex_vat=?,
+                    payload_json=?,
+                    updated_at=?
+                WHERE id=?
+                """
+            ),
+            (
+                customer_name,
+                str(data.get("contactPerson") or ""),
+                str(data.get("customerEmail") or ""),
+                str(data.get("customerPhone") or ""),
+                float(data.get("total_ex_vat") or 0),
+                json.dumps(data, ensure_ascii=False),
+                _utcnow(),
+                quote_id,
+            )
+        )
+
+        await _store_quote_files(conn, quote_id, files)
+        conn.commit()
+
+        return _quote_response(conn, quote_id)
+
+
+@app.get("/api/quotes/{quote_id}/files/{file_id}")
+def download_quote_file(quote_id: str, file_id: str):
+    with _db_connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            _sql(
+                """
+                SELECT filename, content_type, data
+                FROM quote_files
+                WHERE id=%s AND quote_id=%s
+                """,
+                """
+                SELECT filename, content_type, data
+                FROM quote_files
+                WHERE id=? AND quote_id=?
+                """
+            ),
+            (file_id, quote_id)
+        )
+
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Bestand niet gevonden.")
+
+        if isinstance(row, sqlite3.Row):
+            filename = row["filename"]
+            content_type = row["content_type"]
+            data = row["data"]
+        else:
+            filename, content_type, data = row
+
+        safe_name = str(filename).replace('"', "")
+        return Response(
+            content=bytes(data),
+            media_type=content_type or "application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_name}"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+
+@app.delete("/api/quotes/{quote_id}")
+def delete_quote(quote_id: str):
+    with _db_connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            _sql(
+                "DELETE FROM quote_files WHERE quote_id=%s",
+                "DELETE FROM quote_files WHERE quote_id=?"
+            ),
+            (quote_id,)
+        )
+
+        cur.execute(
+            _sql(
+                "DELETE FROM quotes WHERE id=%s",
+                "DELETE FROM quotes WHERE id=?"
+            ),
+            (quote_id,)
+        )
+
+        conn.commit()
+        return {"ok": True, "id": quote_id}
+
+
 @app.get("/")
 def root():
     return {
@@ -731,6 +1240,7 @@ def root():
             "/api/analyze-step",
             "/api/assembly-mesh/{job_id}",
             "/api/solid-mesh/{job_id}/{solid_index}",
+            "/api/quotes",
         ],
     }
 
