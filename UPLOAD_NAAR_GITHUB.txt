@@ -1,0 +1,14 @@
+MAAK EEN NIEUWE GITHUB REPOSITORY:
+vakstaal-step-server
+
+Upload daarin AL deze bestanden:
+- server.py
+- step_analyzer.py
+- requirements.txt
+- Dockerfile
+- .dockerignore
+- render.yaml
+- README.md
+
+Daarna in Render:
+New -> Web Service -> Git Provider -> kies vakstaal-step-server.

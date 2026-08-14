@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: vakstaal-step-server
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    autoDeployTrigger: commit
