@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends     libgl1     
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip     && pip install --no-cache-dir -r requirements.txt
 
-COPY server.py step_analyzer.py ./
+COPY server.py step_analyzer.py dropbox_refresh_token_setup.py ./
 
 ENV PORT=10000
 EXPOSE 10000
