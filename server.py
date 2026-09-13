@@ -4625,9 +4625,38 @@ def list_quotes():
         )
 
         rows = [_row_to_dict(r, cur) for r in cur.fetchall()]
+        # Fetch related metadata in batches instead of two queries per quote.
+        # Binary file contents and full quote payloads are not needed for the list.
+        by_id = {row["id"]: row for row in rows}
         for row in rows:
-            row["files"] = _quote_files(conn, row["id"])
-            row["approval"] = _approval_for_quote(conn, row["id"], create=False)
+            row["files"] = []
+            row["approval"] = None
+
+        if rows:
+            cur.execute("""
+                SELECT f.quote_id, f.id, f.filename, f.content_type, f.file_kind,
+                       f.file_size, f.dropbox_path, f.created_at
+                FROM quote_files f JOIN quotes q ON q.id = f.quote_id
+                ORDER BY f.created_at
+            """)
+            for record in cur.fetchall():
+                item = _row_to_dict(record, cur)
+                quote = by_id.get(item.pop("quote_id"))
+                if quote is not None:
+                    item["storage"] = "dropbox" if item.get("dropbox_path") else "database"
+                    quote["files"].append(item)
+
+            cur.execute("""
+                SELECT a.quote_id, a.token, a.status, a.viewed_at, a.accepted_at,
+                       a.accepted_by, a.note, a.email_sent_at, a.created_at, a.updated_at
+                FROM quote_approvals a JOIN quotes q ON q.id = a.quote_id
+            """)
+            for record in cur.fetchall():
+                approval = _row_to_dict(record, cur)
+                quote = by_id.get(approval["quote_id"])
+                if quote is not None:
+                    approval["url"] = _approval_url(approval.get("token") or "")
+                    quote["approval"] = approval
 
         return {
             "ok": True,
