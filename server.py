@@ -2260,7 +2260,7 @@ async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> li
 
     for upload in files or []:
         filename = _safe_dropbox_name(upload.filename or "bestand", "bestand")
-        data = await upload.read()
+        data = await upload.read(MAX_QUOTE_FILE_MB * 1024 * 1024 + 1)
 
         if not data:
             continue
@@ -2280,29 +2280,20 @@ async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> li
             _sql(
                 """
                 SELECT id, dropbox_path FROM quote_files
-                WHERE quote_id=%s AND filename=%s AND file_size=%s
-                LIMIT 1
+                WHERE quote_id=%s AND filename=%s
+                ORDER BY created_at DESC, id DESC LIMIT 1
                 """,
                 """
                 SELECT id, dropbox_path FROM quote_files
-                WHERE quote_id=? AND filename=? AND file_size=?
-                LIMIT 1
+                WHERE quote_id=? AND filename=?
+                ORDER BY created_at DESC, id DESC LIMIT 1
                 """
             ),
-            (quote_id, filename, len(data))
+            (quote_id, filename)
         )
         existing = cur.fetchone()
-        if existing:
-            existing_path = existing["dropbox_path"] if isinstance(existing, sqlite3.Row) else existing[1]
-            if existing_path:
-                stored_files.append({
-                    "filename": filename,
-                    "dropbox_path": existing_path,
-                    "existing": True,
-                    "size": len(data),
-                })
-                continue
-
+        # Naam en bestandsgrootte bewijzen niet dat de inhoud gelijk is.
+        # Iedere aangeleverde versie moet daarom echt worden opgeslagen.
         uploaded = _dropbox_upload_bytes(dropbox_path, data)
         actual_path = uploaded.get("path_display") or uploaded.get("path_lower") or dropbox_path
 
@@ -2310,10 +2301,10 @@ async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> li
             existing_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
             cur.execute(
                 _sql(
-                    "UPDATE quote_files SET dropbox_path=%s, data=%s WHERE id=%s",
-                    "UPDATE quote_files SET dropbox_path=?, data=? WHERE id=?"
+                    "UPDATE quote_files SET dropbox_path=%s, data=%s, file_size=%s, content_type=%s, file_kind=%s WHERE id=%s",
+                    "UPDATE quote_files SET dropbox_path=?, data=?, file_size=?, content_type=?, file_kind=? WHERE id=?"
                 ),
-                (actual_path, b"", existing_id)
+                (actual_path, b"", len(data), upload.content_type or "application/octet-stream", kind, existing_id)
             )
             stored_files.append({
                 "filename": filename,
@@ -4623,14 +4614,34 @@ def get_quote(quote_id: str):
         return _quote_response(conn, quote_id)
 
 
+def _validated_quote_payload(payload: str) -> dict:
+    """Shared input validation before quote creation or update touches storage."""
+    def reject_constant(value):
+        raise ValueError("Non-finite JSON number")
+
+    try:
+        data = json.loads(payload, parse_constant=reject_constant)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise HTTPException(status_code=400, detail="Ongeldige offertegegevens.") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Offertegegevens moeten een JSON-object zijn.")
+    total = data.get("total_ex_vat")
+    try:
+        if isinstance(total, bool) or (total is not None and not isinstance(total, (str, int, float))):
+            raise ValueError("Unsupported price type")
+        number = float(total or 0)
+        if not math.isfinite(number):
+            raise ValueError("Non-finite total")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail="Het offertetotaal moet een geldig, eindig getal zijn.") from exc
+    return data
+
+
 @app.post("/api/quotes")
 async def create_quote(request: Request):
     form, payload, files = await _parse_large_quote_form(request)
     try:
-        try:
-            data = json.loads(payload)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail="Ongeldige offertegegevens.") from exc
+        data = _validated_quote_payload(payload)
 
         customer_name = str(data.get("customer") or "").strip()
         if not customer_name:
@@ -4703,10 +4714,7 @@ async def create_quote(request: Request):
 async def update_quote(quote_id: str, request: Request):
     form, payload, files = await _parse_large_quote_form(request)
     try:
-        try:
-            data = json.loads(payload)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail="Ongeldige offertegegevens.") from exc
+        data = _validated_quote_payload(payload)
 
         customer_name = str(data.get("customer") or "").strip()
         if not customer_name:
