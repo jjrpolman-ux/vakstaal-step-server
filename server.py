@@ -2105,6 +2105,13 @@ def _init_quote_db() -> None:
             )
         )
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS quote_number_counters (
+                year INTEGER PRIMARY KEY,
+                last_number BIGINT NOT NULL CHECK (last_number >= 0)
+            )
+        """)
+
         # Dropbox metadata toevoegen zonder bestaande offertes te breken.
         if _postgres_enabled():
             cur.execute("ALTER TABLE quote_files ADD COLUMN IF NOT EXISTS dropbox_path TEXT")
@@ -2202,30 +2209,51 @@ def _file_kind(filename: str) -> str:
     return "Bestand"
 
 
-def _next_quote_number(conn) -> str:
+def _next_quote_number() -> str:
+    """Reserve a number in a short transaction, independent of file uploads.
+
+    Reservations survive failed saves: gaps are allowed, reuse is not.
+    The atomic upsert serializes competing reservations across workers.
+    """
     year = datetime.now().year
     prefix = f"VAK-{year}-"
-    cur = conn.cursor()
-
-    cur.execute(
-        _sql(
-            "SELECT quote_number FROM quotes WHERE quote_number LIKE %s ORDER BY quote_number DESC LIMIT 1",
-            "SELECT quote_number FROM quotes WHERE quote_number LIKE ? ORDER BY quote_number DESC LIMIT 1"
-        ),
-        (prefix + "%",)
-    )
-
-    row = cur.fetchone()
-    last = 0
-
-    if row:
-        value = row[0] if not isinstance(row, sqlite3.Row) else row["quote_number"]
-        try:
-            last = int(str(value).rsplit("-", 1)[-1])
-        except Exception:
-            last = 0
-
-    return f"{prefix}{last + 1:04d}"
+    conn = _db_connect()
+    try:
+        with conn:
+            cur = conn.cursor()
+            if not _postgres_enabled():
+                cur.execute("BEGIN IMMEDIATE")
+            cur.execute(_sql(
+                "SELECT last_number FROM quote_number_counters WHERE year=%s",
+                "SELECT last_number FROM quote_number_counters WHERE year=?"
+            ), (year,))
+            seed = 0
+            if cur.fetchone() is None:
+                # Seed a new annual counter numerically, including numbers >9999.
+                cur.execute(_sql(
+                    "SELECT quote_number FROM quotes WHERE quote_number LIKE %s",
+                    "SELECT quote_number FROM quotes WHERE quote_number LIKE ?"
+                ), (prefix + "%",))
+                for row in cur.fetchall():
+                    suffix = str(row[0])[len(prefix):]
+                    if suffix and suffix.isascii() and suffix.isdecimal():
+                        seed = max(seed, int(suffix))
+            cur.execute(_sql(
+                """INSERT INTO quote_number_counters (year, last_number)
+                   VALUES (%s, %s)
+                   ON CONFLICT (year) DO UPDATE SET last_number =
+                   GREATEST(quote_number_counters.last_number + 1, excluded.last_number)
+                   RETURNING last_number""",
+                """INSERT INTO quote_number_counters (year, last_number)
+                   VALUES (?, ?)
+                   ON CONFLICT (year) DO UPDATE SET last_number =
+                   MAX(quote_number_counters.last_number + 1, excluded.last_number)
+                   RETURNING last_number"""
+            ), (year, seed + 1))
+            number = cur.fetchone()[0]
+        return f"{prefix}{number:04d}"
+    finally:
+        conn.close()
 
 
 def _quote_files(conn, quote_id: str) -> list[dict]:
@@ -4650,8 +4678,8 @@ async def create_quote(request: Request):
         quote_id = uuid.uuid4().hex
         now = _utcnow()
 
+        quote_number = _next_quote_number()
         with _db_connect() as conn:
-            quote_number = _next_quote_number(conn)
             cur = conn.cursor()
 
             cur.execute(
