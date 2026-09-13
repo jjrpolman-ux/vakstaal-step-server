@@ -10,10 +10,14 @@ import logging
 import os
 import re
 import secrets
+import smtplib
+import ssl
 import time
 from contextlib import closing
+from email.message import EmailMessage
+from urllib.parse import urlsplit
 
-from fastapi import Request
+from fastapi import Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -23,6 +27,48 @@ ACCESS_SECONDS = 5 * 60
 ITERATIONS = 600_000
 LOG = logging.getLogger("vakstaal.auth")
 TOKEN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+RESET_SECONDS = 15 * 60
+
+
+def admin_email():
+    return os.getenv("VAKSTAAL_ADMIN_EMAIL", "info@vakstaal.nl").strip().lower()
+
+
+def utf8(value):
+    try:
+        return value.encode('utf-8') if isinstance(value, str) else b''
+    except UnicodeError:
+        return b''
+
+
+def hash_password(password):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), ITERATIONS)
+    return f"pbkdf2_sha256${ITERATIONS}${salt}${digest.hex()}"
+
+
+def send_auth_mail(subject, text):
+    # SSL certificate verification is mandatory; no plaintext fallback.
+    message = EmailMessage()
+    message["From"] = os.environ["VAKSTAAL_SMTP_FROM"]
+    message["To"] = admin_email()
+    message["Subject"] = subject
+    message.set_content(text)
+    with smtplib.SMTP_SSL(os.environ["VAKSTAAL_SMTP_HOST"],
+                          int(os.getenv("VAKSTAAL_SMTP_PORT", "465")),
+                          timeout=10, context=ssl.create_default_context()) as smtp:
+        smtp.login(os.environ["VAKSTAAL_SMTP_USER"], os.environ["VAKSTAAL_SMTP_PASSWORD"])
+        smtp.send_message(message)
+
+
+def send_change_notice():
+    try:
+        send_auth_mail("Je Vakstaal-wachtwoord is gewijzigd",
+                       "Je beheerderswachtwoord voor de Vakstaal calculator is gewijzigd.\n"
+                       "Alle bestaande sessies zijn beëindigd.\n\n"
+                       "Was jij dit niet? Neem direct contact op met je beheerder en beveilig je mailbox.\n")
+    except Exception:
+        LOG.error("Password change notification could not be sent")
 
 
 def fingerprint(value):
@@ -37,7 +83,10 @@ def verify_password(password, encoded):
     if not valid_password_hash(encoded) or not isinstance(password, str):
         return False
     _, count, salt, expected = encoded.split("$")
-    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), int(count))
+    password_bytes = utf8(password)
+    if not password_bytes:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password_bytes, bytes.fromhex(salt), int(count))
     return hmac.compare_digest(actual.hex(), expected)
 
 
@@ -56,10 +105,85 @@ class AuthStore:
             cur.execute("CREATE TABLE IF NOT EXISTS admin_access_tokens (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES admin_sessions(id) ON DELETE CASCADE, expires BIGINT NOT NULL)")
             cur.execute("CREATE TABLE IF NOT EXISTS admin_login_limits (bucket BIGINT PRIMARY KEY, attempts INTEGER NOT NULL)")
             cur.execute("CREATE INDEX IF NOT EXISTS admin_access_session ON admin_access_tokens(session_id)")
+            cur.execute("CREATE TABLE IF NOT EXISTS admin_credentials (id INTEGER PRIMARY KEY, bootstrap TEXT NOT NULL, password_hash TEXT NOT NULL)")
+            cur.execute("INSERT INTO admin_credentials(id,bootstrap,password_hash) VALUES (1,'','') ON CONFLICT(id) DO NOTHING")
+            cur.execute("CREATE TABLE IF NOT EXISTS admin_reset_tokens (id TEXT PRIMARY KEY, expires BIGINT NOT NULL, owner TEXT NOT NULL)")
+            cur.execute("CREATE TABLE IF NOT EXISTS admin_auth_limits (purpose TEXT NOT NULL, bucket BIGINT NOT NULL, attempts INTEGER NOT NULL, PRIMARY KEY(purpose,bucket))")
             conn.commit()
 
     def sql(self, value):
         return value.replace("?", "%s") if self.postgres() else value
+
+    @staticmethod
+    def effective(row, bootstrap):
+        if not valid_password_hash(bootstrap):
+            return ""
+        return row[1] if row and row[0] == fingerprint(bootstrap) else bootstrap
+
+    def credential(self, bootstrap):
+        with closing(self.connect()) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT bootstrap,password_hash FROM admin_credentials WHERE id=1")
+            return self.effective(cur.fetchone(), bootstrap)
+
+    def lock_account(self, conn):
+        cur = conn.cursor()
+        if not self.postgres():
+            cur.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT bootstrap,password_hash FROM admin_credentials WHERE id=1" +
+                    (" FOR UPDATE" if self.postgres() else ""))
+        return cur, cur.fetchone()
+
+    def limited(self, purpose, limit=8, seconds=300):
+        bucket = int(time.time()) // seconds
+        with closing(self.connect()) as conn:
+            cur = conn.cursor()
+            cur.execute(self.sql("DELETE FROM admin_auth_limits WHERE purpose=? AND bucket<?"), (purpose, bucket - 1))
+            cur.execute(self.sql("INSERT INTO admin_auth_limits(purpose,bucket,attempts) VALUES (?,?,1) ON CONFLICT(purpose,bucket) DO UPDATE SET attempts=admin_auth_limits.attempts+1 RETURNING attempts"), (purpose, bucket))
+            count = cur.fetchone()[0]
+            conn.commit()
+            return count <= limit
+
+    def new_reset(self, bootstrap, email):
+        raw = secrets.token_urlsafe(32)
+        with closing(self.connect()) as conn:
+            cur, row = self.lock_account(conn)
+            encoded = self.effective(row, bootstrap)
+            if not valid_password_hash(encoded):
+                return None
+            now = int(time.time())
+            cur.execute(self.sql("DELETE FROM admin_reset_tokens WHERE expires<=?"), (now,))
+            cur.execute(self.sql("INSERT INTO admin_reset_tokens(id,expires,owner) VALUES (?,?,?)"),
+                        (fingerprint(raw), now + RESET_SECONDS, fingerprint(encoded + '\n' + email)))
+            conn.commit()
+        return raw
+
+    def discard_reset(self, raw):
+        with closing(self.connect()) as conn:
+            cur = conn.cursor()
+            cur.execute(self.sql("DELETE FROM admin_reset_tokens WHERE id=?"), (fingerprint(raw),))
+            conn.commit()
+
+    def redeem_reset(self, raw, encoded, bootstrap, email):
+        if not isinstance(raw, str) or not TOKEN.fullmatch(raw) or not valid_password_hash(encoded):
+            return False
+        with closing(self.connect()) as conn:
+            # Lock the single account so concurrent links cannot both succeed.
+            cur, row = self.lock_account(conn)
+            current = self.effective(row, bootstrap)
+            if not valid_password_hash(current):
+                return False
+            cur.execute(self.sql("DELETE FROM admin_reset_tokens WHERE id=? AND expires>? AND owner=? RETURNING id"),
+                        (fingerprint(raw), int(time.time()), fingerprint(current + '\n' + email)))
+            if not cur.fetchone():
+                return False
+            cur.execute(self.sql("UPDATE admin_credentials SET bootstrap=?,password_hash=? WHERE id=1"),
+                        (fingerprint(bootstrap), encoded))
+            cur.execute("DELETE FROM admin_access_tokens")
+            cur.execute("DELETE FROM admin_sessions")
+            cur.execute("DELETE FROM admin_reset_tokens")
+            conn.commit()
+        return True
 
     def attempt_allowed(self):
         # A global one-admin limit cannot be bypassed by rotating IP headers,
@@ -127,7 +251,7 @@ def install_auth(app, connect, postgres):
     origins = {os.getenv("VAKSTAAL_APP_ORIGIN", "https://vakstaal-calculator.vercel.app").rstrip("/")}
 
     def credential():
-        return os.getenv("VAKSTAAL_ADMIN_PASSWORD_HASH", "")
+        return store.credential(os.getenv("VAKSTAAL_ADMIN_PASSWORD_HASH", ""))
 
     def public(request):
         p, m = request.url.path, request.method
@@ -144,13 +268,17 @@ def install_auth(app, connect, postgres):
         if public(request):
             response = await call_next(request)
         else:
-            encoded = credential()
+            try:
+                encoded = await run_in_threadpool(credential)
+            except Exception:
+                LOG.error("Credential validation unavailable")
+                return reply(503, "Sessiecontrole tijdelijk niet beschikbaar. Probeer opnieuw.")
             if not valid_password_hash(encoded):
                 return reply(503, "Beveiliging is nog niet ingesteld. Neem contact op met de beheerder.")
             if request.method not in {"GET", "HEAD"} and request.headers.get("origin") not in origins:
                 return reply(403, "Dit verzoek komt niet van het vaste calculatoradres.")
             p = request.url.path
-            if p in {"/api/auth/login", "/api/auth/session", "/api/auth/logout"}:
+            if p in {"/api/auth/login", "/api/auth/session", "/api/auth/logout", "/api/auth/forgot", "/api/auth/reset"}:
                 response = await call_next(request)
             else:
                 auth = request.headers.get("authorization", "")
@@ -185,9 +313,13 @@ def install_auth(app, connect, postgres):
             response = reply(429, "Te veel inlogpogingen. Wacht vijf minuten en probeer opnieuw.")
             response.headers["Retry-After"] = "300"
             return response
-        encoded = credential()
-        if not await run_in_threadpool(verify_password, data["password"], encoded):
-            return reply(401, "Wachtwoord is niet juist.")
+        encoded = await run_in_threadpool(credential)
+        password_ok = await run_in_threadpool(verify_password, data["password"], encoded)
+        supplied_email = data.get("email", "")
+        email_ok = isinstance(supplied_email, str) and hmac.compare_digest(
+            utf8(supplied_email.strip().lower()), utf8(admin_email()))
+        if not password_ok or not email_ok:
+            return reply(401, "E-mailadres of wachtwoord is niet juist.")
         await run_in_threadpool(store.revoke, request.cookies.get(COOKIE))
         raw = await run_in_threadpool(store.new_session, encoded)
         response = reply(200, "Ingelogd.")
@@ -209,6 +341,84 @@ def install_auth(app, connect, postgres):
     def logout(request: Request):
         store.revoke(request.cookies.get(COOKIE))
         response = reply(200, "Uitgelogd.")
+        response.delete_cookie(COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+        return response
+
+    async def reset_body(request):
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 4096:
+                return None
+        try:
+            data = json.loads(body)
+            return data if isinstance(data, dict) else None
+        except (ValueError, UnicodeError):
+            return None
+
+    def deliver_reset(supplied_email):
+        # Runs after the generic response, including for unknown addresses.
+        # Never log the message, SMTP exception, password, or reset token.
+        raw = None
+        try:
+            email = admin_email()
+            if not hmac.compare_digest(supplied_email.encode(), email.encode()):
+                return
+            if not store.limited("reset-mail", 3, RESET_SECONDS):
+                return
+            origin = next(iter(origins))
+            parsed = urlsplit(origin)
+            if parsed.scheme != "https" or not parsed.netloc or parsed.path or parsed.query or parsed.fragment:
+                raise ValueError("Invalid configured origin")
+            raw = store.new_reset(os.getenv("VAKSTAAL_ADMIN_PASSWORD_HASH", ""), email)
+            if raw is None:
+                return
+            # Fragment never reaches web-server access logs. Browser removes it
+            # immediately and sends the token only in the POST request body.
+            link = origin + "/reset-password#token=" + raw
+            send_auth_mail("Stel je Vakstaal-wachtwoord opnieuw in",
+                           "Je hebt een nieuw wachtwoord aangevraagd voor de Vakstaal calculator.\n\n"
+                           + link + "\n\nDeze link is 15 minuten geldig en werkt één keer.\n"
+                           "Heb je dit niet aangevraagd? Negeer deze mail; je wachtwoord blijft hetzelfde.\n")
+        except Exception:
+            LOG.error("Password reset email could not be sent; check SMTP configuration")
+            if raw:
+                try:
+                    store.discard_reset(raw)
+                except Exception:
+                    LOG.error("Failed reset token cleanup unavailable")
+
+    @app.post("/api/auth/forgot")
+    async def forgot(request: Request, background_tasks: BackgroundTasks):
+        data = await reset_body(request)
+        if not data or not isinstance(data.get("email"), str) or len(data["email"]) > 254 or not utf8(data["email"]):
+            return reply(400, "Vul een geldig e-mailadres in.")
+        if not await run_in_threadpool(store.limited, "forgot", 20, 300):
+            return reply(429, "Te veel aanvragen. Wacht vijf minuten en probeer opnieuw.")
+        background_tasks.add_task(deliver_reset, data["email"].strip().lower())
+        return reply(200, "Als dit e-mailadres bij het beheerdersaccount hoort, ontvang je een herstellink. Controleer ook je spammap. Maximaal drie herstelmails per 15 minuten.")
+
+    @app.post("/api/auth/reset")
+    async def reset(request: Request, background_tasks: BackgroundTasks):
+        data = await reset_body(request)
+        if not data:
+            return reply(400, "Ongeldig herstelverzoek.")
+        if not await run_in_threadpool(store.limited, "reset", 8, 300):
+            return reply(429, "Te veel pogingen. Wacht vijf minuten en probeer opnieuw.")
+        password, confirm, raw = data.get("password"), data.get("confirm_password"), data.get("token")
+        if not isinstance(password, str) or not 15 <= len(password) <= 128 or not 1 <= len(utf8(password)) <= 512:
+            return reply(400, "Gebruik een wachtwoord van 15 tot 128 tekens.")
+        if password != confirm:
+            return reply(400, "De wachtwoorden zijn niet gelijk.")
+        if not isinstance(raw, str) or not TOKEN.fullmatch(raw):
+            return reply(400, "Deze herstellink is ongeldig of verlopen. Vraag een nieuwe aan.")
+        encoded = await run_in_threadpool(hash_password, password)
+        changed = await run_in_threadpool(store.redeem_reset, raw, encoded,
+                                         os.getenv("VAKSTAAL_ADMIN_PASSWORD_HASH", ""), admin_email())
+        if not changed:
+            return reply(400, "Deze herstellink is ongeldig of verlopen. Vraag een nieuwe aan.")
+        background_tasks.add_task(send_change_notice)
+        response = reply(200, "Je wachtwoord is gewijzigd. Log opnieuw in met je nieuwe wachtwoord.")
         response.delete_cookie(COOKIE, path="/", secure=True, httponly=True, samesite="strict")
         return response
 
