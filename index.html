@@ -53431,7 +53431,45 @@ async function finalizeQuoteStepEdit(batch,{geometryChanged=false,toast=true}={}
   }
 }
 
+function captureStepBundleRollback(){
+  const quoteId=currentSavedQuoteId;
+  const state=JSON.parse(JSON.stringify({
+    committedQuoteMaterialLines,calculationMaterialLines,stepBatchUseCounts,
+    calculationStepBatchUseCounts,quoteStepBodyCatalogs,materialImportSessions,
+    materials,materialEnabledStates,stepMaterialContributions,
+    automaticMachineTimeLastValue,automaticMachineTimeOverrideWarned
+  }));
+  const controls=['minutes','offerMinutes'].map(id=>({
+    id,value:document.getElementById(id)?.value
+  }));
+  return ()=>{
+    if(currentSavedQuoteId!==quoteId){
+      throw new Error('De actieve offerte is gewisseld; automatisch herstel is niet uitgevoerd.');
+    }
+    ({committedQuoteMaterialLines,calculationMaterialLines,stepBatchUseCounts,
+      calculationStepBatchUseCounts,quoteStepBodyCatalogs,materialImportSessions,
+      materials,materialEnabledStates,stepMaterialContributions,
+      automaticMachineTimeLastValue,automaticMachineTimeOverrideWarned}=state);
+    controls.forEach(({id,value})=>{
+      const input=document.getElementById(id);
+      if(input && value!==undefined) input.value=value;
+    });
+    // Replace any intermediate draft/snapshot before a render can read it.
+    v563SyncAuthoritativeQuoteStateNow();
+    saveActiveQuoteWorkspace({dirty:true,immediate:true});
+    // Recompute display totals from restored data without rerunning the failed
+    // automatic-time operation. Display errors cannot undo the restored state.
+    for(const refresh of [syncAggregatedMaterialsFromCalculationLines,
+      rebuildStepMaterialContributionsFromCalculationLines,calc,
+      renderQuoteOverviewDetails,renderSelectedMaterials]){
+      try{ refresh(); }catch(error){ console.error('Weergave na herstel:',error); }
+    }
+  };
+}
+
 async function setQuoteStepFileCount(batch, requestedCount){
+  if(v605QuoteMutationBusy) return false;
+  let rollback=null;
   const key=String(batch||'STEP-bestand');
   const desired=Math.max(1,Math.round(Number(requestedCount)||1));
   const current=Math.max(1,quoteStepLiveFileUseCount(key));
@@ -53448,7 +53486,9 @@ async function setQuoteStepFileCount(batch, requestedCount){
     stepBatches:[key],
     geometryChanged:false,
     successMessage:`✓ ${key}: ${desired}× STEP · materiaal, snijkosten, prijs en tijden bijgewerkt.`,
+    rollback:()=>{ if(rollback) rollback(); },
     mutate:async()=>{
+      rollback=captureStepBundleRollback();
       const rebuilt=rebuildQuoteStepBundleToCount(key,desired);
       if(!rebuilt){
         throw new Error(
@@ -70506,17 +70546,25 @@ async function v605FinalizeQuoteMutation({
   };
 }
 
+let v605QuoteMutationBusy=false;
+
 async function v605RunQuoteMutation({
   title='Offerte bijwerken…',
   detail='Wijzigingen worden verwerkt',
   mutate,
   stepBatches=[],
   geometryChanged=false,
-  successMessage=''
+  successMessage='',
+  rollback=null
 }={}){
-  const progress=v605CreateMutationProgress(title,detail);
-
+  if(v605QuoteMutationBusy){
+    showVakstaalToast('De vorige wijziging wordt nog verwerkt. Probeer het daarna opnieuw.');
+    return false;
+  }
+  v605QuoteMutationBusy=true;
+  let progress=null;
   try{
+    progress=v605CreateMutationProgress(title,detail);
     progress.set(14,title,'Nieuwe aantallen en regels worden verwerkt');
     await v485NextPaint();
 
@@ -70546,20 +70594,28 @@ async function v605RunQuoteMutation({
     return mutationResult ?? true;
   }catch(err){
     console.error('Offertemutatie mislukt:',err);
-    progress.fail();
+    let restored=false;
+    if(typeof rollback==='function'){
+      try{ await rollback(); restored=true; }
+      catch(restoreError){ console.error('Herstel offerte mislukt:',restoreError); }
+    }
+    try{ progress?.fail(); }catch(_){}
 
     await showVakstaalChoice({
       title:'Wijziging kon niet worden afgerond',
       message:
         `${String(err?.message||err||'Onbekende fout')}\n\n`+
-        `De voortgang is afgesloten. Controleer de offerteregels voordat je opnieuw opslaat.`,
+        (restored
+          ? 'De vorige aantallen en berekening zijn teruggezet. Je kunt de wijziging opnieuw proberen.'
+          : 'Controleer de offerteregels voordat je opnieuw opslaat; automatisch herstel is niet bevestigd.'),
       type:'warning',
       actions:[{label:'OK',value:'ok',primary:true}]
     });
     return false;
   }finally{
     // Hard guarantee: nooit een oude voortgang laten staan.
-    progress.close?.();
+    v605QuoteMutationBusy=false;
+    try{ progress?.close?.(); }catch(_){}
     if(!v411ProgressTokens.size){
       document.getElementById('v411GlobalProgress')?.classList.remove('is-visible');
     }
