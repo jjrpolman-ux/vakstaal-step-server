@@ -48,15 +48,7 @@ STEP_PROFILE_RECOGNITION_VERSION = 12  # v771: topology-based outer skin + tabs/
 
 app = FastAPI(title="Vakstaal STEP Server", version="1.0.0")
 
-# No cookies/auth are used, so wildcard CORS is safe for this API.
-# Later this can be restricted to calculator.vakstaal.nl / vercel.app.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
+# Authentication and outermost CORS are installed after route declarations.
 
 
 
@@ -2015,6 +2007,8 @@ def _postgres_enabled() -> bool:
 
 
 def _db_connect():
+    if DATABASE_URL and psycopg is None:
+        raise RuntimeError("DATABASE_URL is ingesteld maar psycopg ontbreekt; geen stille SQLite-terugval.")
     if _postgres_enabled():
         return psycopg.connect(DATABASE_URL)
 
@@ -5602,7 +5596,7 @@ p{{line-height:1.55;color:#c4d9e3;white-space:pre-wrap}}
         except Exception:
             expected=""
 
-    if expected and state != expected:
+    if not expected or not state or not __import__('hmac').compare_digest(state, expected):
         return callback_page(
             "Dropbox-koppeling geweigerd",
             "De OAuth state komt niet overeen. Start de autorisatie opnieuw vanuit de Vakstaal-app.",
@@ -6882,6 +6876,19 @@ async def dropbox_cut_layers_scan(request: Request):
         "failed_count": failed_count,
         "files": output,
     }
+
+from vakstaal_auth import install_auth
+
+install_auth(app, _db_connect, _postgres_enabled)
+# Outermost: authentication errors also receive the restricted CORS headers.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("VAKSTAAL_APP_ORIGIN", "https://vakstaal-calculator.vercel.app").rstrip("/")],
+    allow_credentials=False,
+    allow_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["Content-Disposition", "Retry-After"],
+)
 
 if __name__ == "__main__":
     import uvicorn

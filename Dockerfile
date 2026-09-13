@@ -5,12 +5,12 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends     libgl1     libglib2.0-0     libxrender1     libxext6     && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libxrender1 libxext6 && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip     && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-COPY server.py step_analyzer.py dropbox_refresh_token_setup_v2.py ./
+COPY server.py step_analyzer.py dropbox_refresh_token_setup_v2.py vakstaal_auth.py ./
 
 ENV PORT=10000
 EXPOSE 10000
