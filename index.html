@@ -21610,6 +21610,7 @@ nav #openQuotesNavList button.open-quote-close .open-quote-close-icon path{
 <div class="kpi calculation-total-kpi">
 <span>Gecalculeerde materiaalprijs</span>
 <strong id="matTotal">€ 0,00</strong>
+<small id="matWasteTotal" style="display:block;font-size:11px;margin-top:5px"></small>
 </div>
 <div class="v670-calculation-save-status" id="v670CalculationSaveStatus" aria-live="polite" style="display:none">
   <span class="v670-save-spinner" aria-hidden="true"></span>
@@ -49186,32 +49187,7 @@ function currentCalculationMaterialSellTotal(){
   );
 
   if(lines.length){
-    /*
-     * v83:
-     * Eerst totale millimeters per gelijke meterprijs optellen en daarna één
-     * keer vermenigvuldigen. Daardoor is 2000 × 60 mm exact 120 meter en
-     * ontstaat geen optelfout door 2000 losse floating-point bedragen.
-     */
-    const groups=new Map();
-
-    lines.forEach(line=>{
-      const lengthMm=Math.max(0,Number(line.lengthMm)||0);
-      const pricing=calculationLinePricing(line);
-      const sell=Math.max(0,Number(pricing.sell)||0);
-      const key=sell.toFixed(8);
-
-      if(!groups.has(key)){
-        groups.set(key,{totalMm:0,sell});
-      }
-      groups.get(key).totalMm+=lengthMm;
-    });
-
-    let total=0;
-    groups.forEach(group=>{
-      total+=(group.totalMm/1000)*group.sell;
-    });
-
-    return total;
+    return v676AuthoritativeMaterialPricing(lines).sellTotal;
   }
 
   // Alleen voor zeer oude calculaties zonder losse regels.
@@ -49401,6 +49377,17 @@ function updateCalculationMaterialFooter(){
   const matTotal=document.getElementById('matTotal');
   if(matTotal){
     matTotal.textContent=formatCalculationEuro(currentCalculationMaterialSellTotal());
+  }
+
+  const wasteLabel=document.getElementById('matWasteTotal');
+  if(wasteLabel){
+    const lines=(calculationMaterialLines||[]).filter(line=>
+      line && line.enabled!==false && !line.hiddenFromPreparedList
+    );
+    const pricing=v676AuthoritativeMaterialPricing(lines);
+    wasteLabel.textContent=pricing.wasteSellTotal>0
+      ? `Waarvan klem-/eindverlies: ${formatCalculationEuro(pricing.wasteSellTotal)}`
+      : '';
   }
 
   const btn=document.getElementById('calculationProductsSaveBtn') ||
@@ -58600,12 +58587,15 @@ async function saveCurrentQuoteToDatabase(options={}){
     }catch(e){}
 
     persistActiveQuote();
-    registerCurrentQuoteAsOpen({persisted:true});
+    registerCurrentQuoteAsOpen({dirty:true});
 
     // Iedere keer dat de offerte wordt opgeslagen ook automatisch de actuele
     // klantofferte-PDF genereren en aan exact dezelfde offerte koppelen.
     try{ saveProgress?.set(82,'pdf','active','Klantofferte PDF maken…','Actuele verkoopprijzen en offertegegevens verwerken'); }catch(e){}
     const automaticPdf=await uploadAutomaticCustomerQuotePdf(status);
+    if(!automaticPdf){
+      throw new Error('De klantofferte-PDF is niet aangemaakt. Sla de offerte opnieuw op.');
+    }
     try{
       saveProgress?.set(
         94,'pdf',automaticPdf?'done':'done',
@@ -58640,7 +58630,13 @@ async function saveCurrentQuoteToDatabase(options={}){
     }catch(e){}
     return true;
   }catch(err){
-    if(status) status.textContent='Opslaan mislukt';
+    // The data request may have succeeded while PDF/STEP confirmation failed.
+    // Retain its ID for retry, but never present this partial save as complete.
+    try{
+      registerCurrentQuoteAsOpen({dirty:true});
+      saveActiveQuoteWorkspace({dirty:true,immediate:true});
+    }catch(draftError){ console.error('Concept bewaren na opslagfout:',draftError); }
+    if(status) status.textContent='Niet volledig opgeslagen · opnieuw opslaan';
     if(saveProgress){
       try{ saveProgress.fail(err?.message||String(err||'Onbekende fout')); }catch(e){}
     }else{
@@ -59028,6 +59024,24 @@ function v860QuoteOpenProgress(quoteId){
   };
 }
 
+function selectSavedQuoteMaterialLines(payload,totalExVat=0){
+  if(!payload || typeof payload!=='object' || Array.isArray(payload)){
+    throw new Error('De opgeslagen offertegegevens hebben een ongeldig formaat.');
+  }
+  // An explicitly saved empty array is authoritative, even with a nonzero
+  // total (for example startup costs). Legacy rows must never resurrect it.
+  if(Object.prototype.hasOwnProperty.call(payload,'committedQuoteMaterialLines')){
+    if(!Array.isArray(payload.committedQuoteMaterialLines)){
+      throw new Error('De opgeslagen offerteregels kunnen niet worden gelezen.');
+    }
+    return payload.committedQuoteMaterialLines.filter(Boolean);
+  }
+  const total=Number(payload.total_ex_vat ?? totalExVat ?? 0);
+  return total>0 && Array.isArray(payload.calculationMaterialLines)
+    ? payload.calculationMaterialLines.filter(Boolean)
+    : [];
+}
+
 async function openSavedQuote(id){
   const openProgress=v860QuoteOpenProgress(id);
   if(!openProgress) return false;
@@ -59055,12 +59069,12 @@ async function openSavedQuote(id){
       registerCurrentQuoteAsOpen({dirty:true});
     }
 
-    // Eventuele oude niet-opgeslagen werkstand van de gekozen opgeslagen
-    // offerte verwijderen voordat de serverversie wordt geladen.
-    try{ removeOpenQuoteWorkspace(id); }catch(e){}
+    // Keep the existing draft until the saved version has loaded successfully.
+    // The workspace entry is replaced at the end; a failed fetch must not delete it.
 
     const data=await fetchSavedQuote(id);
     const d=data.payload||{};
+    const authoritativeSavedLines=selectSavedQuoteMaterialLines(d,data.total_ex_vat);
     openProgress.set(38,'Offerte ontvangen','Prijsinstellingen en klantgegevens controleren.');
 
     // De prijskeuze moet altijd vrij bedienbaar blijven en komt daarom boven
@@ -59102,33 +59116,6 @@ async function openSavedQuote(id){
     if(Array.isArray(d.materials)) materials=mergeQuoteMaterialsWithPersistentLibrary(d.materials);
     calculationMaterialLines=[];
 
-    const savedCommittedLines=Array.isArray(d.committedQuoteMaterialLines)
-      ? d.committedQuoteMaterialLines.filter(Boolean)
-      : [];
-    const savedLegacyCalculationLines=Array.isArray(d.calculationMaterialLines)
-      ? d.calculationMaterialLines.filter(Boolean)
-      : [];
-
-    const savedQuoteTotalRaw=
-      d.total_ex_vat ??
-      data.total_ex_vat ??
-      0;
-    const savedQuoteTotal=Math.max(0,Number(savedQuoteTotalRaw)||0);
-
-    /*
-     * v72 — opgeslagen offerte is bron van waarheid.
-     *
-     * 1. Expliciet opgeslagen committed regels zijn altijd geldig.
-     * 2. Alleen voor oude offertes zonder committed-veld gebruiken we de oude
-     *    calculationMaterialLines als de opgeslagen offerte ook echt een
-     *    bedrag > 0 heeft.
-     * 3. Offerte € 0 + geen committed regels = werkelijk lege offerte.
-     *    Oude lokale of legacy STEP-regels mogen dan niet terugkomen.
-     */
-    const authoritativeSavedLines=savedCommittedLines.length
-      ? savedCommittedLines
-      : (savedQuoteTotal>0 ? savedLegacyCalculationLines : []);
-
     committedQuoteMaterialLines=JSON.parse(JSON.stringify(
       authoritativeSavedLines
     )).map(line=>({
@@ -59137,12 +59124,6 @@ async function openSavedQuote(id){
       inQuote:true
     }));
     openProgress.set(70,'Materialen herstellen…','Profielen, aantallen en bewerkingen worden opgebouwd.');
-
-    if(committedQuoteMaterialLines.length){
-      v476StoreQuoteMaterialSnapshot(committedQuoteMaterialLines);
-    }else{
-      v476ClearQuoteMaterialSnapshot();
-    }
 
     // Geen opgeslagen productregels = ook geen oude STEP-offertetellers.
     stepBatchUseCounts=committedQuoteMaterialLines.length
@@ -59173,13 +59154,19 @@ async function openSavedQuote(id){
       ? JSON.parse(JSON.stringify(d.quoteStepBodyCatalogs))
       : {};
 
+    currentSavedQuoteId=data.id;
+    currentSavedQuoteNumber=data.quote_number||'';
+    if(committedQuoteMaterialLines.length){
+      v476StoreQuoteMaterialSnapshot(committedQuoteMaterialLines);
+    }else{
+      v476ClearQuoteMaterialSnapshot();
+    }
+
     // v674 — de opgeslagen STEP-teller kan uit een oudere versie komen.
     // De actuele fysieke bodyregels + bodycatalogus zijn leidend.
     rebuildStepBatchUseCountsFromCommitted();
     calculationStepBatchUseCounts={...(stepBatchUseCounts||{})};
 
-    currentSavedQuoteId=data.id;
-    currentSavedQuoteNumber=data.quote_number||'';
     currentOpenedQuoteFiles=data.files||[];
     setQuoteDataEditing(false);
   currentStepSourceFile=null;
