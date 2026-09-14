@@ -6494,6 +6494,170 @@ def eboekhouden_relation_search(q: str="", limit: int=10):
         "relations":[_eboek_relation_public(r) for r in unique]
     }
 
+# ============================================================================
+# v775 — klantofferte per e-mail verzenden
+# Gebruikt dezelfde SMTP-server als de bestaande akkoord-notificaties.
+# De ontvanger wordt ALTIJD uit de opgeslagen offerte gelezen; de browser kan
+# dus niet een willekeurig extern ontvangeradres aan dit endpoint meegeven.
+# ============================================================================
+
+def _quote_mail_smtp_configured() -> bool:
+    return all(
+        str(os.environ.get(key) or "").strip()
+        for key in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD")
+    )
+
+
+def _quote_mail_clean_header(value: str, fallback: str = "") -> str:
+    return str(value or fallback).replace("\r", " ").replace("\n", " ").strip()
+
+
+def _quote_mail_valid_email(value: str) -> bool:
+    value = _quote_mail_clean_header(value)
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value))
+
+
+def _send_quote_mail_smtp(
+    *,
+    recipient: str,
+    sender_email: str,
+    sender_name: str,
+    quote_number: str,
+    customer_name: str,
+    pdf_bytes: bytes,
+    pdf_filename: str,
+) -> None:
+    if not _quote_mail_smtp_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "De mailserver is nog niet ingesteld. "
+                "Stel SMTP_HOST, SMTP_PORT, SMTP_USER en SMTP_PASSWORD in op de Vakstaal-server."
+            ),
+        )
+
+    recipient = _quote_mail_clean_header(recipient)
+    sender_email = _quote_mail_clean_header(sender_email)
+    sender_name = _quote_mail_clean_header(sender_name, "Vakstaal")
+    quote_number = _quote_mail_clean_header(quote_number, "Offerte")
+    customer_name = _quote_mail_clean_header(customer_name, "klant")
+    pdf_filename = _quote_mail_clean_header(pdf_filename, f"{quote_number}.pdf")
+
+    if not _quote_mail_valid_email(recipient):
+        raise HTTPException(status_code=400, detail="Bij deze offerte staat geen geldig klant-e-mailadres.")
+    if not _quote_mail_valid_email(sender_email):
+        raise HTTPException(status_code=400, detail="Het ingestelde afzender e-mailadres is niet geldig.")
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="De klantofferte-PDF ontbreekt.")
+
+    host = str(os.environ.get("SMTP_HOST") or "").strip()
+    port = int(os.environ.get("SMTP_PORT") or "587")
+    user = str(os.environ.get("SMTP_USER") or "").strip()
+    password = str(os.environ.get("SMTP_PASSWORD") or "").strip()
+    use_ssl = (
+        str(os.environ.get("SMTP_SSL") or "").strip().lower() in {"1", "true", "yes"}
+        or port == 465
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Offerte {quote_number} van {sender_name}"
+    msg["From"] = f"{sender_name} <{sender_email}>"
+    msg["Reply-To"] = sender_email
+    msg["To"] = recipient
+    msg.set_content(
+        f"Beste {customer_name},\n\n"
+        f"In de bijlage ontvangt u onze offerte {quote_number}.\n\n"
+        "In de PDF kunt u de offerte bekijken en, wanneer beschikbaar, digitaal accepteren.\n\n"
+        "Met vriendelijke groet,\n"
+        f"{sender_name}\n"
+        f"{sender_email}\n"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=pdf_filename,
+    )
+
+    ctx = ssl.create_default_context()
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=25, context=ctx) as smtp:
+                smtp.login(user, password)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=25) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=ctx)
+                smtp.ehlo()
+                smtp.login(user, password)
+                smtp.send_message(msg)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"De mailserver kon de offerte niet verzenden: {exc}",
+        ) from exc
+
+
+@app.get("/api/mail/status")
+def quote_mail_status():
+    return {
+        "ok": True,
+        "configured": _quote_mail_smtp_configured(),
+        "smtp_user": str(os.environ.get("SMTP_USER") or "").strip(),
+        "default_from": str(os.environ.get("SMTP_FROM") or "").strip(),
+    }
+
+
+@app.post("/api/quotes/{quote_id}/send-email")
+async def send_quote_email(
+    quote_id: str,
+    pdf: UploadFile = File(...),
+    sender_email: str = Form(...),
+    sender_name: str = Form("Vakstaal"),
+):
+    with _db_connect() as conn:
+        quote = _quote_response(conn, quote_id)
+
+    payload = quote.get("payload") or {}
+    recipient = str(
+        quote.get("customer_email")
+        or payload.get("customerEmail")
+        or ""
+    ).strip()
+    customer_name = str(
+        quote.get("customer_name")
+        or payload.get("customer")
+        or "klant"
+    ).strip()
+    quote_number = str(quote.get("quote_number") or "Offerte").strip()
+
+    content = await pdf.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="De offerte-PDF is groter dan 20 MB.")
+
+    _send_quote_mail_smtp(
+        recipient=recipient,
+        sender_email=sender_email,
+        sender_name=sender_name,
+        quote_number=quote_number,
+        customer_name=customer_name,
+        pdf_bytes=content,
+        pdf_filename=pdf.filename or f"{quote_number}.pdf",
+    )
+
+    return {
+        "ok": True,
+        "quote_id": quote_id,
+        "quote_number": quote_number,
+        "recipient": recipient,
+        "sender_email": _quote_mail_clean_header(sender_email),
+        "filename": pdf.filename or f"{quote_number}.pdf",
+        "sent_at": _utcnow(),
+    }
+
 @app.post("/api/quotes/{quote_id}/eboekhouden-invoice")
 def create_eboekhouden_invoice(quote_id: str):
     with _db_connect() as conn:
