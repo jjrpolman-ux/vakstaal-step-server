@@ -6555,6 +6555,11 @@ def _send_quote_mail_smtp(
     customer_name: str,
     pdf_bytes: bytes,
     pdf_filename: str,
+    mail_subject: str = "",
+    mail_body: str = "",
+    signature_logo_bytes: bytes = b"",
+    signature_logo_type: str = "image/png",
+    signature_logo_filename: str = "vakstaal-handtekening.png",
 ) -> None:
     if not _quote_mail_smtp_configured():
         raise HTTPException(
@@ -6587,19 +6592,58 @@ def _send_quote_mail_smtp(
     configured_from=_quote_mail_clean_header(smtp_cfg.get("from") or user)
     use_ssl=bool(smtp_cfg.get("ssl") or port==465)
 
-    msg = EmailMessage()
-    msg["Subject"] = f"Offerte {quote_number} van {sender_name}"
-    msg["From"] = f"{sender_name} <{sender_email}>"
-    msg["Reply-To"] = sender_email
-    msg["To"] = recipient
-    msg.set_content(
+    subject = _quote_mail_clean_header(
+        mail_subject,
+        f"Offerte {quote_number} van {sender_name}"
+    )
+    body = str(mail_body or "").strip() or (
         f"Beste {customer_name},\n\n"
         f"In de bijlage ontvangt u onze offerte {quote_number}.\n\n"
         "In de PDF kunt u de offerte bekijken en, wanneer beschikbaar, digitaal accepteren.\n\n"
         "Met vriendelijke groet,\n"
         f"{sender_name}\n"
-        f"{sender_email}\n"
+        f"{sender_email}"
     )
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{sender_name} <{sender_email}>"
+    msg["Reply-To"] = sender_email
+    msg["To"] = recipient
+    msg.set_content(body)
+
+    # HTML-versie gebruikt exact dezelfde tekst, veilig ge-escaped.
+    html_body = "<div style=\"font-family:Arial,sans-serif;font-size:14px;line-height:1.55;color:#1d2b33\">" + \
+        html.escape(body).replace("\n","<br>") + "</div>"
+
+    if signature_logo_bytes:
+        html_body += (
+            "<div style=\"margin-top:22px\">"
+            "<img src=\"cid:vakstaal-signature-logo\" "
+            "style=\"max-width:220px;max-height:90px;display:block\" "
+            "alt=\"Vakstaal\">"
+            "</div>"
+        )
+
+    msg.add_alternative(html_body, subtype="html")
+
+    if signature_logo_bytes:
+        html_part = msg.get_payload()[-1]
+        logo_type = str(signature_logo_type or "image/png").lower()
+        if "/" in logo_type:
+            maintype, subtype = logo_type.split("/",1)
+        else:
+            maintype, subtype = "image", "png"
+        if maintype != "image":
+            maintype, subtype = "image", "png"
+        html_part.add_related(
+            signature_logo_bytes,
+            maintype=maintype,
+            subtype=subtype,
+            cid="<vakstaal-signature-logo>",
+            filename=_quote_mail_clean_header(signature_logo_filename, "vakstaal-handtekening.png"),
+        )
+
     msg.add_attachment(
         pdf_bytes,
         maintype="application",
@@ -6647,6 +6691,9 @@ async def send_quote_email(
     pdf: UploadFile = File(...),
     sender_email: str = Form(...),
     sender_name: str = Form("Vakstaal"),
+    mail_subject: str = Form(""),
+    mail_body: str = Form(""),
+    signature_logo: UploadFile = File(None),
 ):
     with _db_connect() as conn:
         quote = _quote_response(conn, quote_id)
@@ -6668,6 +6715,16 @@ async def send_quote_email(
     if len(content) > 20 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="De offerte-PDF is groter dan 20 MB.")
 
+    signature_logo_bytes=b""
+    signature_logo_type="image/png"
+    signature_logo_filename="vakstaal-handtekening.png"
+    if signature_logo is not None:
+        signature_logo_bytes=await signature_logo.read()
+        if len(signature_logo_bytes)>1024*1024:
+            raise HTTPException(status_code=413,detail="Het handtekeninglogo is groter dan 1 MB.")
+        signature_logo_type=str(signature_logo.content_type or "image/png")
+        signature_logo_filename=str(signature_logo.filename or "vakstaal-handtekening.png")
+
     _send_quote_mail_smtp(
         recipient=recipient,
         sender_email=sender_email,
@@ -6676,16 +6733,57 @@ async def send_quote_email(
         customer_name=customer_name,
         pdf_bytes=content,
         pdf_filename=pdf.filename or f"{quote_number}.pdf",
+        mail_subject=mail_subject,
+        mail_body=mail_body,
+        signature_logo_bytes=signature_logo_bytes,
+        signature_logo_type=signature_logo_type,
+        signature_logo_filename=signature_logo_filename,
     )
+
+    # v874 — succesvolle offerte-mail duurzaam registreren bij de offerte.
+    # Alleen NA succesvolle SMTP-verzending opslaan, zodat de status nooit
+    # onterecht "verstuurd" kan worden.
+    sent_at=_utcnow()
+    clean_sender=_quote_mail_clean_header(sender_email)
+    filename=pdf.filename or f"{quote_number}.pdf"
+    history=payload.get("quoteMailHistory")
+    if not isinstance(history,list):
+        history=[]
+    history=[
+        item for item in history
+        if isinstance(item,dict)
+    ][-49:]
+    history.append({
+        "sent_at":sent_at,
+        "recipient":recipient,
+        "sender_email":clean_sender,
+        "filename":filename,
+    })
+    payload["quoteMailHistory"]=history
+    payload["quoteLastMailedAt"]=sent_at
+    payload["quoteLastMailedTo"]=recipient
+    payload["quoteLastMailedFrom"]=clean_sender
+
+    with _db_connect() as conn:
+        cur=conn.cursor()
+        cur.execute(
+            _sql(
+                "UPDATE quotes SET payload_json=%s,updated_at=%s WHERE id=%s",
+                "UPDATE quotes SET payload_json=?,updated_at=? WHERE id=?"
+            ),
+            (json.dumps(payload,ensure_ascii=False),sent_at,quote_id)
+        )
+        conn.commit()
 
     return {
         "ok": True,
         "quote_id": quote_id,
         "quote_number": quote_number,
         "recipient": recipient,
-        "sender_email": _quote_mail_clean_header(sender_email),
-        "filename": pdf.filename or f"{quote_number}.pdf",
-        "sent_at": _utcnow(),
+        "sender_email": clean_sender,
+        "filename": filename,
+        "sent_at": sent_at,
+        "mail_count": len(history),
     }
 
 @app.post("/api/quotes/{quote_id}/eboekhouden-invoice")
@@ -6747,10 +6845,26 @@ def create_eboekhouden_invoice(quote_id: str):
 
     invoice=_eboek_http("POST","/v1/invoice",body=invoice_body)
 
-    # Persist relation id in quote payload so future invoices/searches are exact.
+    # Persist relation id + lifecycle-status in quote payload so future
+    # invoices/searches én het klantstatusvenster exact blijven.
+    invoiced_at=_utcnow()
     payload["eboekhoudenRelationId"]=int(relation_id)
     payload["eboekhoudenLastInvoiceId"]=invoice.get("id")
     payload["eboekhoudenLastInvoiceNumber"]=invoice.get("invoiceNumber") or invoice.get("invoice_number") or ""
+    payload["eboekhoudenInvoicedAt"]=invoiced_at
+    invoice_history=payload.get("eboekhoudenInvoiceHistory")
+    if not isinstance(invoice_history,list):
+        invoice_history=[]
+    invoice_history=[
+        item for item in invoice_history
+        if isinstance(item,dict)
+    ][-19:]
+    invoice_history.append({
+        "id":invoice.get("id"),
+        "number":invoice.get("invoiceNumber") or invoice.get("invoice_number") or "",
+        "invoiced_at":invoiced_at,
+    })
+    payload["eboekhoudenInvoiceHistory"]=invoice_history
     with _db_connect() as conn:
         cur=conn.cursor()
         cur.execute(
@@ -6765,6 +6879,7 @@ def create_eboekhouden_invoice(quote_id: str):
         "relation":_eboek_relation_public(relation),
         "relation_created":created_relation,
         "invoice":invoice,
+        "invoiced_at":invoiced_at,
         "ledger_code":revenue_code,
         "template_id":template_id,
     }
