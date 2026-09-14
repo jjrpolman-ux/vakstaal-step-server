@@ -6494,6 +6494,16 @@ def eboekhouden_relation_search(q: str="", limit: int=10):
         "relations":[_eboek_relation_public(r) for r in unique]
     }
 
+@app.get("/api/eboekhouden/relations/{relation_id}")
+def eboekhouden_relation_detail(relation_id: int):
+    rel=_eboek_get_relation(relation_id)
+    if not isinstance(rel,dict) or not rel.get("id"):
+        raise HTTPException(status_code=404,detail="e-Boekhouden relatie is niet gevonden.")
+    return {
+        "ok":True,
+        "relation":_eboek_relation_public(rel)
+    }
+
 # ============================================================================
 # v775 — klantofferte per e-mail verzenden
 # Gebruikt dezelfde SMTP-server als de bestaande akkoord-notificaties.
