@@ -4808,17 +4808,42 @@ def list_quotes():
         cur.execute(
             """
             SELECT id, quote_number, customer_name, contact_person, customer_email,
-                   customer_phone, total_ex_vat, created_at, updated_at
+                   customer_phone, total_ex_vat, payload_json, created_at, updated_at
             FROM quotes
             ORDER BY updated_at DESC
             """
         )
 
         rows = [_row_to_dict(r, cur) for r in cur.fetchall()]
-        # Fetch related metadata in batches instead of two queries per quote.
-        # Binary file contents and full quote payloads are not needed for the list.
+        # Alleen de lichte lifecycle-velden uit payload_json zijn nodig om in het
+        # offerte-overzicht de actuele status te tonen. De volledige payload gaat
+        # bewust niet mee in /api/quotes.
         by_id = {row["id"]: row for row in rows}
         for row in rows:
+            raw_payload = row.pop("payload_json", "")
+            try:
+                payload = json.loads(raw_payload or "{}")
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+
+            mail_history = payload.get("quoteMailHistory")
+            if not isinstance(mail_history, list):
+                mail_history = []
+            last_mail = next(
+                (item for item in reversed(mail_history) if isinstance(item, dict)),
+                None,
+            )
+
+            row["_list_lifecycle"] = {
+                "last_mail_at": str((last_mail or {}).get("sent_at") or (last_mail or {}).get("sentAt") or ""),
+                "last_mail_to": str((last_mail or {}).get("recipient") or (last_mail or {}).get("to") or ""),
+                "invoice_id": str(payload.get("eboekhoudenLastInvoiceId") or ""),
+                "invoice_number": str(payload.get("eboekhoudenLastInvoiceNumber") or ""),
+                "invoiced_at": str(payload.get("eboekhoudenInvoicedAt") or ""),
+                "invoice_mailed_at": str(payload.get("eboekhoudenInvoiceMailedAt") or ""),
+            }
             row["files"] = []
             row["approval"] = None
 
@@ -4847,6 +4872,47 @@ def list_quotes():
                 if quote is not None:
                     approval["url"] = _approval_url(approval.get("token") or "")
                     quote["approval"] = approval
+
+        # Eén eenduidige actuele status voor de lijst. Prioriteit volgt de echte
+        # offerte-lifecycle: gefactureerd > geaccepteerd > bekeken > verstuurd > opgeslagen.
+        for row in rows:
+            lifecycle = row.pop("_list_lifecycle", {}) or {}
+            approval = row.get("approval") or {}
+
+            invoice_id = str(lifecycle.get("invoice_id") or "")
+            invoice_number = str(lifecycle.get("invoice_number") or "")
+            invoice_mailed_at = str(lifecycle.get("invoice_mailed_at") or "")
+            invoiced_at = str(lifecycle.get("invoiced_at") or "")
+            last_mail_at = str(lifecycle.get("last_mail_at") or "")
+            last_mail_to = str(lifecycle.get("last_mail_to") or "")
+
+            if invoice_id or invoice_number:
+                row["quote_status"] = "invoiced"
+                row["quote_status_label"] = "Gefactureerd & gemaild" if invoice_mailed_at else "Gefactureerd"
+                row["quote_status_detail"] = (
+                    f"Factuur {invoice_number}" if invoice_number else "Factuur aangemaakt"
+                )
+                row["quote_status_at"] = invoice_mailed_at or invoiced_at
+            elif str(approval.get("status") or "").lower() == "accepted":
+                row["quote_status"] = "accepted"
+                row["quote_status_label"] = "Geaccepteerd"
+                row["quote_status_detail"] = str(approval.get("accepted_by") or "Klant")
+                row["quote_status_at"] = str(approval.get("accepted_at") or "")
+            elif approval.get("viewed_at"):
+                row["quote_status"] = "viewed"
+                row["quote_status_label"] = "Bekeken"
+                row["quote_status_detail"] = "Wacht op akkoord"
+                row["quote_status_at"] = str(approval.get("viewed_at") or "")
+            elif last_mail_at:
+                row["quote_status"] = "mailed"
+                row["quote_status_label"] = "Verstuurd"
+                row["quote_status_detail"] = last_mail_to or "Per e-mail verstuurd"
+                row["quote_status_at"] = last_mail_at
+            else:
+                row["quote_status"] = "saved"
+                row["quote_status_label"] = "Opgeslagen"
+                row["quote_status_detail"] = "Nog niet verstuurd"
+                row["quote_status_at"] = str(row.get("updated_at") or row.get("created_at") or "")
 
         return {
             "ok": True,
