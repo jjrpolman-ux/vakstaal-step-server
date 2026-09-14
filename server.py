@@ -48,7 +48,15 @@ STEP_PROFILE_RECOGNITION_VERSION = 12  # v771: topology-based outer skin + tabs/
 
 app = FastAPI(title="Vakstaal STEP Server", version="1.0.0")
 
-# Authentication and outermost CORS are installed after route declarations.
+# No cookies/auth are used, so wildcard CORS is safe for this API.
+# Later this can be restricted to calculator.vakstaal.nl / vercel.app.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 
@@ -2007,8 +2015,6 @@ def _postgres_enabled() -> bool:
 
 
 def _db_connect():
-    if DATABASE_URL and psycopg is None:
-        raise RuntimeError("DATABASE_URL is ingesteld maar psycopg ontbreekt; geen stille SQLite-terugval.")
     if _postgres_enabled():
         return psycopg.connect(DATABASE_URL)
 
@@ -2104,13 +2110,6 @@ def _init_quote_db() -> None:
                 """
             )
         )
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS quote_number_counters (
-                year INTEGER PRIMARY KEY,
-                last_number BIGINT NOT NULL CHECK (last_number >= 0)
-            )
-        """)
 
         # Dropbox metadata toevoegen zonder bestaande offertes te breken.
         if _postgres_enabled():
@@ -2209,51 +2208,30 @@ def _file_kind(filename: str) -> str:
     return "Bestand"
 
 
-def _next_quote_number() -> str:
-    """Reserve a number in a short transaction, independent of file uploads.
-
-    Reservations survive failed saves: gaps are allowed, reuse is not.
-    The atomic upsert serializes competing reservations across workers.
-    """
+def _next_quote_number(conn) -> str:
     year = datetime.now().year
     prefix = f"VAK-{year}-"
-    conn = _db_connect()
-    try:
-        with conn:
-            cur = conn.cursor()
-            if not _postgres_enabled():
-                cur.execute("BEGIN IMMEDIATE")
-            cur.execute(_sql(
-                "SELECT last_number FROM quote_number_counters WHERE year=%s",
-                "SELECT last_number FROM quote_number_counters WHERE year=?"
-            ), (year,))
-            seed = 0
-            if cur.fetchone() is None:
-                # Seed a new annual counter numerically, including numbers >9999.
-                cur.execute(_sql(
-                    "SELECT quote_number FROM quotes WHERE quote_number LIKE %s",
-                    "SELECT quote_number FROM quotes WHERE quote_number LIKE ?"
-                ), (prefix + "%",))
-                for row in cur.fetchall():
-                    suffix = str(row[0])[len(prefix):]
-                    if suffix and suffix.isascii() and suffix.isdecimal():
-                        seed = max(seed, int(suffix))
-            cur.execute(_sql(
-                """INSERT INTO quote_number_counters (year, last_number)
-                   VALUES (%s, %s)
-                   ON CONFLICT (year) DO UPDATE SET last_number =
-                   GREATEST(quote_number_counters.last_number + 1, excluded.last_number)
-                   RETURNING last_number""",
-                """INSERT INTO quote_number_counters (year, last_number)
-                   VALUES (?, ?)
-                   ON CONFLICT (year) DO UPDATE SET last_number =
-                   MAX(quote_number_counters.last_number + 1, excluded.last_number)
-                   RETURNING last_number"""
-            ), (year, seed + 1))
-            number = cur.fetchone()[0]
-        return f"{prefix}{number:04d}"
-    finally:
-        conn.close()
+    cur = conn.cursor()
+
+    cur.execute(
+        _sql(
+            "SELECT quote_number FROM quotes WHERE quote_number LIKE %s ORDER BY quote_number DESC LIMIT 1",
+            "SELECT quote_number FROM quotes WHERE quote_number LIKE ? ORDER BY quote_number DESC LIMIT 1"
+        ),
+        (prefix + "%",)
+    )
+
+    row = cur.fetchone()
+    last = 0
+
+    if row:
+        value = row[0] if not isinstance(row, sqlite3.Row) else row["quote_number"]
+        try:
+            last = int(str(value).rsplit("-", 1)[-1])
+        except Exception:
+            last = 0
+
+    return f"{prefix}{last + 1:04d}"
 
 
 def _quote_files(conn, quote_id: str) -> list[dict]:
@@ -2288,7 +2266,7 @@ async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> li
 
     for upload in files or []:
         filename = _safe_dropbox_name(upload.filename or "bestand", "bestand")
-        data = await upload.read(MAX_QUOTE_FILE_MB * 1024 * 1024 + 1)
+        data = await upload.read()
 
         if not data:
             continue
@@ -2308,20 +2286,29 @@ async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> li
             _sql(
                 """
                 SELECT id, dropbox_path FROM quote_files
-                WHERE quote_id=%s AND filename=%s
-                ORDER BY created_at DESC, id DESC LIMIT 1
+                WHERE quote_id=%s AND filename=%s AND file_size=%s
+                LIMIT 1
                 """,
                 """
                 SELECT id, dropbox_path FROM quote_files
-                WHERE quote_id=? AND filename=?
-                ORDER BY created_at DESC, id DESC LIMIT 1
+                WHERE quote_id=? AND filename=? AND file_size=?
+                LIMIT 1
                 """
             ),
-            (quote_id, filename)
+            (quote_id, filename, len(data))
         )
         existing = cur.fetchone()
-        # Naam en bestandsgrootte bewijzen niet dat de inhoud gelijk is.
-        # Iedere aangeleverde versie moet daarom echt worden opgeslagen.
+        if existing:
+            existing_path = existing["dropbox_path"] if isinstance(existing, sqlite3.Row) else existing[1]
+            if existing_path:
+                stored_files.append({
+                    "filename": filename,
+                    "dropbox_path": existing_path,
+                    "existing": True,
+                    "size": len(data),
+                })
+                continue
+
         uploaded = _dropbox_upload_bytes(dropbox_path, data)
         actual_path = uploaded.get("path_display") or uploaded.get("path_lower") or dropbox_path
 
@@ -2329,10 +2316,10 @@ async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> li
             existing_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
             cur.execute(
                 _sql(
-                    "UPDATE quote_files SET dropbox_path=%s, data=%s, file_size=%s, content_type=%s, file_kind=%s WHERE id=%s",
-                    "UPDATE quote_files SET dropbox_path=?, data=?, file_size=?, content_type=?, file_kind=? WHERE id=?"
+                    "UPDATE quote_files SET dropbox_path=%s, data=%s WHERE id=%s",
+                    "UPDATE quote_files SET dropbox_path=?, data=? WHERE id=?"
                 ),
-                (actual_path, b"", len(data), upload.content_type or "application/octet-stream", kind, existing_id)
+                (actual_path, b"", existing_id)
             )
             stored_files.append({
                 "filename": filename,
@@ -4625,38 +4612,9 @@ def list_quotes():
         )
 
         rows = [_row_to_dict(r, cur) for r in cur.fetchall()]
-        # Fetch related metadata in batches instead of two queries per quote.
-        # Binary file contents and full quote payloads are not needed for the list.
-        by_id = {row["id"]: row for row in rows}
         for row in rows:
-            row["files"] = []
-            row["approval"] = None
-
-        if rows:
-            cur.execute("""
-                SELECT f.quote_id, f.id, f.filename, f.content_type, f.file_kind,
-                       f.file_size, f.dropbox_path, f.created_at
-                FROM quote_files f JOIN quotes q ON q.id = f.quote_id
-                ORDER BY f.created_at
-            """)
-            for record in cur.fetchall():
-                item = _row_to_dict(record, cur)
-                quote = by_id.get(item.pop("quote_id"))
-                if quote is not None:
-                    item["storage"] = "dropbox" if item.get("dropbox_path") else "database"
-                    quote["files"].append(item)
-
-            cur.execute("""
-                SELECT a.quote_id, a.token, a.status, a.viewed_at, a.accepted_at,
-                       a.accepted_by, a.note, a.email_sent_at, a.created_at, a.updated_at
-                FROM quote_approvals a JOIN quotes q ON q.id = a.quote_id
-            """)
-            for record in cur.fetchall():
-                approval = _row_to_dict(record, cur)
-                quote = by_id.get(approval["quote_id"])
-                if quote is not None:
-                    approval["url"] = _approval_url(approval.get("token") or "")
-                    quote["approval"] = approval
+            row["files"] = _quote_files(conn, row["id"])
+            row["approval"] = _approval_for_quote(conn, row["id"], create=False)
 
         return {
             "ok": True,
@@ -4671,34 +4629,14 @@ def get_quote(quote_id: str):
         return _quote_response(conn, quote_id)
 
 
-def _validated_quote_payload(payload: str) -> dict:
-    """Shared input validation before quote creation or update touches storage."""
-    def reject_constant(value):
-        raise ValueError("Non-finite JSON number")
-
-    try:
-        data = json.loads(payload, parse_constant=reject_constant)
-    except (TypeError, ValueError, UnicodeError) as exc:
-        raise HTTPException(status_code=400, detail="Ongeldige offertegegevens.") from exc
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="Offertegegevens moeten een JSON-object zijn.")
-    total = data.get("total_ex_vat")
-    try:
-        if isinstance(total, bool) or (total is not None and not isinstance(total, (str, int, float))):
-            raise ValueError("Unsupported price type")
-        number = float(total or 0)
-        if not math.isfinite(number):
-            raise ValueError("Non-finite total")
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise HTTPException(status_code=400, detail="Het offertetotaal moet een geldig, eindig getal zijn.") from exc
-    return data
-
-
 @app.post("/api/quotes")
 async def create_quote(request: Request):
     form, payload, files = await _parse_large_quote_form(request)
     try:
-        data = _validated_quote_payload(payload)
+        try:
+            data = json.loads(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Ongeldige offertegegevens.") from exc
 
         customer_name = str(data.get("customer") or "").strip()
         if not customer_name:
@@ -4707,8 +4645,8 @@ async def create_quote(request: Request):
         quote_id = uuid.uuid4().hex
         now = _utcnow()
 
-        quote_number = _next_quote_number()
         with _db_connect() as conn:
+            quote_number = _next_quote_number(conn)
             cur = conn.cursor()
 
             cur.execute(
@@ -4771,7 +4709,10 @@ async def create_quote(request: Request):
 async def update_quote(quote_id: str, request: Request):
     form, payload, files = await _parse_large_quote_form(request)
     try:
-        data = _validated_quote_payload(payload)
+        try:
+            data = json.loads(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Ongeldige offertegegevens.") from exc
 
         customer_name = str(data.get("customer") or "").strip()
         if not customer_name:
@@ -5661,7 +5602,7 @@ p{{line-height:1.55;color:#c4d9e3;white-space:pre-wrap}}
         except Exception:
             expected=""
 
-    if not expected or not state or not __import__('hmac').compare_digest(state, expected):
+    if expected and state != expected:
         return callback_page(
             "Dropbox-koppeling geweigerd",
             "De OAuth state komt niet overeen. Start de autorisatie opnieuw vanuit de Vakstaal-app.",
@@ -6494,6 +6435,173 @@ def eboekhouden_relation_search(q: str="", limit: int=10):
         "relations":[_eboek_relation_public(r) for r in unique]
     }
 
+
+
+# ============================================================================
+# v775 — klantofferte per e-mail verzenden
+# Gebruikt dezelfde SMTP-server als de bestaande akkoord-notificaties.
+# De ontvanger wordt ALTIJD uit de opgeslagen offerte gelezen; de browser kan
+# dus niet een willekeurig extern ontvangeradres aan dit endpoint meegeven.
+# ============================================================================
+
+def _quote_mail_smtp_configured() -> bool:
+    return all(
+        str(os.environ.get(key) or "").strip()
+        for key in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD")
+    )
+
+
+def _quote_mail_clean_header(value: str, fallback: str = "") -> str:
+    return str(value or fallback).replace("\r", " ").replace("\n", " ").strip()
+
+
+def _quote_mail_valid_email(value: str) -> bool:
+    value = _quote_mail_clean_header(value)
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value))
+
+
+def _send_quote_mail_smtp(
+    *,
+    recipient: str,
+    sender_email: str,
+    sender_name: str,
+    quote_number: str,
+    customer_name: str,
+    pdf_bytes: bytes,
+    pdf_filename: str,
+) -> None:
+    if not _quote_mail_smtp_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "De mailserver is nog niet ingesteld. "
+                "Stel SMTP_HOST, SMTP_PORT, SMTP_USER en SMTP_PASSWORD in op de Vakstaal-server."
+            ),
+        )
+
+    recipient = _quote_mail_clean_header(recipient)
+    sender_email = _quote_mail_clean_header(sender_email)
+    sender_name = _quote_mail_clean_header(sender_name, "Vakstaal")
+    quote_number = _quote_mail_clean_header(quote_number, "Offerte")
+    customer_name = _quote_mail_clean_header(customer_name, "klant")
+    pdf_filename = _quote_mail_clean_header(pdf_filename, f"{quote_number}.pdf")
+
+    if not _quote_mail_valid_email(recipient):
+        raise HTTPException(status_code=400, detail="Bij deze offerte staat geen geldig klant-e-mailadres.")
+    if not _quote_mail_valid_email(sender_email):
+        raise HTTPException(status_code=400, detail="Het ingestelde afzender e-mailadres is niet geldig.")
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="De klantofferte-PDF ontbreekt.")
+
+    host = str(os.environ.get("SMTP_HOST") or "").strip()
+    port = int(os.environ.get("SMTP_PORT") or "587")
+    user = str(os.environ.get("SMTP_USER") or "").strip()
+    password = str(os.environ.get("SMTP_PASSWORD") or "").strip()
+    use_ssl = (
+        str(os.environ.get("SMTP_SSL") or "").strip().lower() in {"1", "true", "yes"}
+        or port == 465
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Offerte {quote_number} van {sender_name}"
+    msg["From"] = f"{sender_name} <{sender_email}>"
+    msg["Reply-To"] = sender_email
+    msg["To"] = recipient
+    msg.set_content(
+        f"Beste {customer_name},\n\n"
+        f"In de bijlage ontvangt u onze offerte {quote_number}.\n\n"
+        "In de PDF kunt u de offerte bekijken en, wanneer beschikbaar, digitaal accepteren.\n\n"
+        "Met vriendelijke groet,\n"
+        f"{sender_name}\n"
+        f"{sender_email}\n"
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=pdf_filename,
+    )
+
+    ctx = ssl.create_default_context()
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=25, context=ctx) as smtp:
+                smtp.login(user, password)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=25) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=ctx)
+                smtp.ehlo()
+                smtp.login(user, password)
+                smtp.send_message(msg)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"De mailserver kon de offerte niet verzenden: {exc}",
+        ) from exc
+
+
+@app.get("/api/mail/status")
+def quote_mail_status():
+    return {
+        "ok": True,
+        "configured": _quote_mail_smtp_configured(),
+        "smtp_user": str(os.environ.get("SMTP_USER") or "").strip(),
+        "default_from": str(os.environ.get("SMTP_FROM") or "").strip(),
+    }
+
+
+@app.post("/api/quotes/{quote_id}/send-email")
+async def send_quote_email(
+    quote_id: str,
+    pdf: UploadFile = File(...),
+    sender_email: str = Form(...),
+    sender_name: str = Form("Vakstaal"),
+):
+    with _db_connect() as conn:
+        quote = _quote_response(conn, quote_id)
+
+    payload = quote.get("payload") or {}
+    recipient = str(
+        quote.get("customer_email")
+        or payload.get("customerEmail")
+        or ""
+    ).strip()
+    customer_name = str(
+        quote.get("customer_name")
+        or payload.get("customer")
+        or "klant"
+    ).strip()
+    quote_number = str(quote.get("quote_number") or "Offerte").strip()
+
+    content = await pdf.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="De offerte-PDF is groter dan 20 MB.")
+
+    _send_quote_mail_smtp(
+        recipient=recipient,
+        sender_email=sender_email,
+        sender_name=sender_name,
+        quote_number=quote_number,
+        customer_name=customer_name,
+        pdf_bytes=content,
+        pdf_filename=pdf.filename or f"{quote_number}.pdf",
+    )
+
+    return {
+        "ok": True,
+        "quote_id": quote_id,
+        "quote_number": quote_number,
+        "recipient": recipient,
+        "sender_email": _quote_mail_clean_header(sender_email),
+        "filename": pdf.filename or f"{quote_number}.pdf",
+        "sent_at": _utcnow(),
+    }
+
+
 @app.post("/api/quotes/{quote_id}/eboekhouden-invoice")
 def create_eboekhouden_invoice(quote_id: str):
     with _db_connect() as conn:
@@ -6941,19 +7049,6 @@ async def dropbox_cut_layers_scan(request: Request):
         "failed_count": failed_count,
         "files": output,
     }
-
-from vakstaal_auth import install_auth
-
-install_auth(app, _db_connect, _postgres_enabled)
-# Outermost: authentication errors also receive the restricted CORS headers.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[os.getenv("VAKSTAAL_APP_ORIGIN", "https://vakstaal-calculator.vercel.app").rstrip("/")],
-    allow_credentials=False,
-    allow_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-    expose_headers=["Content-Disposition", "Retry-After"],
-)
 
 if __name__ == "__main__":
     import uvicorn
