@@ -6501,11 +6501,40 @@ def eboekhouden_relation_search(q: str="", limit: int=10):
 # dus niet een willekeurig extern ontvangeradres aan dit endpoint meegeven.
 # ============================================================================
 
+def _quote_mail_smtp_settings() -> dict:
+    """Gebruik eerst de gewone SMTP_* instellingen en val daarna terug op
+    dezelfde VAKSTAAL_SMTP_* instellingen die de bestaande login/reset-mail gebruikt.
+    Daardoor hoeft er geen tweede mailserverconfiguratie naast de bestaande te staan.
+    """
+    generic={
+        "host":str(os.environ.get("SMTP_HOST") or "").strip(),
+        "port":int(os.environ.get("SMTP_PORT") or "587"),
+        "user":str(os.environ.get("SMTP_USER") or "").strip(),
+        "password":str(os.environ.get("SMTP_PASSWORD") or "").strip(),
+        "from":str(os.environ.get("SMTP_FROM") or "").strip(),
+        "ssl":str(os.environ.get("SMTP_SSL") or "").strip().lower() in {"1","true","yes"},
+        "source":"SMTP_*",
+    }
+    if generic["host"] and generic["user"] and generic["password"]:
+        generic["ssl"]=bool(generic["ssl"] or generic["port"]==465)
+        return generic
+
+    vakstaal={
+        "host":str(os.environ.get("VAKSTAAL_SMTP_HOST") or "").strip(),
+        "port":int(os.environ.get("VAKSTAAL_SMTP_PORT") or "465"),
+        "user":str(os.environ.get("VAKSTAAL_SMTP_USER") or "").strip(),
+        "password":str(os.environ.get("VAKSTAAL_SMTP_PASSWORD") or "").strip(),
+        "from":str(os.environ.get("VAKSTAAL_SMTP_FROM") or "").strip(),
+        "ssl":True,
+        "source":"VAKSTAAL_SMTP_*",
+    }
+    vakstaal["ssl"]=bool(vakstaal["port"]==465 or str(os.environ.get("VAKSTAAL_SMTP_SSL") or "true").strip().lower() in {"1","true","yes"})
+    return vakstaal
+
+
 def _quote_mail_smtp_configured() -> bool:
-    return all(
-        str(os.environ.get(key) or "").strip()
-        for key in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD")
-    )
+    cfg=_quote_mail_smtp_settings()
+    return bool(cfg.get("host") and cfg.get("user") and cfg.get("password"))
 
 
 def _quote_mail_clean_header(value: str, fallback: str = "") -> str:
@@ -6532,7 +6561,7 @@ def _send_quote_mail_smtp(
             status_code=503,
             detail=(
                 "De mailserver is nog niet ingesteld. "
-                "Stel SMTP_HOST, SMTP_PORT, SMTP_USER en SMTP_PASSWORD in op de Vakstaal-server."
+                "De offerte-mail gebruikt automatisch de bestaande SMTP_* of VAKSTAAL_SMTP_* instellingen van de Vakstaal-server."
             ),
         )
 
@@ -6550,14 +6579,13 @@ def _send_quote_mail_smtp(
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="De klantofferte-PDF ontbreekt.")
 
-    host = str(os.environ.get("SMTP_HOST") or "").strip()
-    port = int(os.environ.get("SMTP_PORT") or "587")
-    user = str(os.environ.get("SMTP_USER") or "").strip()
-    password = str(os.environ.get("SMTP_PASSWORD") or "").strip()
-    use_ssl = (
-        str(os.environ.get("SMTP_SSL") or "").strip().lower() in {"1", "true", "yes"}
-        or port == 465
-    )
+    smtp_cfg=_quote_mail_smtp_settings()
+    host=str(smtp_cfg.get("host") or "").strip()
+    port=int(smtp_cfg.get("port") or 587)
+    user=str(smtp_cfg.get("user") or "").strip()
+    password=str(smtp_cfg.get("password") or "").strip()
+    configured_from=_quote_mail_clean_header(smtp_cfg.get("from") or user)
+    use_ssl=bool(smtp_cfg.get("ssl") or port==465)
 
     msg = EmailMessage()
     msg["Subject"] = f"Offerte {quote_number} van {sender_name}"
@@ -6584,14 +6612,14 @@ def _send_quote_mail_smtp(
         if use_ssl:
             with smtplib.SMTP_SSL(host, port, timeout=25, context=ctx) as smtp:
                 smtp.login(user, password)
-                smtp.send_message(msg)
+                smtp.send_message(msg, from_addr=configured_from or user, to_addrs=[recipient])
         else:
             with smtplib.SMTP(host, port, timeout=25) as smtp:
                 smtp.ehlo()
                 smtp.starttls(context=ctx)
                 smtp.ehlo()
                 smtp.login(user, password)
-                smtp.send_message(msg)
+                smtp.send_message(msg, from_addr=configured_from or user, to_addrs=[recipient])
     except HTTPException:
         raise
     except Exception as exc:
@@ -6603,11 +6631,13 @@ def _send_quote_mail_smtp(
 
 @app.get("/api/mail/status")
 def quote_mail_status():
+    cfg=_quote_mail_smtp_settings()
     return {
         "ok": True,
         "configured": _quote_mail_smtp_configured(),
-        "smtp_user": str(os.environ.get("SMTP_USER") or "").strip(),
-        "default_from": str(os.environ.get("SMTP_FROM") or "").strip(),
+        "smtp_user": str(cfg.get("user") or "").strip(),
+        "default_from": str(cfg.get("from") or "").strip(),
+        "config_source": str(cfg.get("source") or ""),
     }
 
 
