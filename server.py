@@ -6526,7 +6526,40 @@ def _eboek_hydrate_relation_list_items(items, limit=20):
             print(f"e-Boekhouden relation detail {relation_id} warning: {exc}")
     return hydrated
 
-def _eboek_find_or_create_relation(payload):
+def _eboek_payload_address_parts(payload: dict) -> dict:
+    street=str(payload.get("customerStreet") or "").strip()
+    house=str(payload.get("customerHouseNumber") or "").strip()
+    postal=str(payload.get("customerPostalCode") or "").strip()
+    city=str(payload.get("customerCity") or "").strip()
+
+    legacy=str(payload.get("customerAddress") or "").strip()
+    if legacy and (not street or not postal or not city):
+        chunks=[part.strip() for part in legacy.split(",") if part.strip()]
+        first=chunks[0] if chunks else ""
+        if first and not street:
+            match=re.match(r"^(.*?\D)\s+(\d+[A-Za-z0-9\-/ ]*)$",first)
+            if match:
+                street=match.group(1).strip()
+                if not house:
+                    house=match.group(2).strip()
+            else:
+                street=first
+        if len(chunks)>1 and not postal:
+            postal=chunks[1]
+        if len(chunks)>2 and not city:
+            city=", ".join(chunks[2:])
+
+    address_line=" ".join(part for part in (street,house) if part).strip()
+    return {
+        "street":street,
+        "houseNumber":house,
+        "address":address_line,
+        "postalCode":postal,
+        "city":city,
+    }
+
+
+def _eboek_find_or_create_relation(payload, force_create=False):
     relation_id=payload.get("eboekhoudenRelationId")
     if relation_id:
         try:
@@ -6537,32 +6570,55 @@ def _eboek_find_or_create_relation(payload):
 
     name=str(payload.get("customer") or "").strip()
     email=str(payload.get("customerEmail") or "").strip()
+
+    # RelationListItem bevat alleen id/type/code. Hydrateer eerst voordat we
+    # namen/e-mail vergelijken, anders kan dezelfde klant dubbel aangemaakt worden.
     if email:
-        rows=_eboek_find_relations(email=email,limit=10)
-        if rows: return rows[0],False
+        items=_eboek_find_relations(email=email,limit=10)
+        rows=_eboek_hydrate_relation_list_items(items,limit=10)
+        exact_email=[
+            r for r in rows
+            if email.casefold() in {
+                str(r.get("emailAddress") or r.get("email_address") or "").strip().casefold(),
+                str(r.get("emailAddressInvoice") or r.get("email_address_invoice") or "").strip().casefold(),
+            }
+        ]
+        if exact_email:
+            return exact_email[0],False
+        if rows:
+            return rows[0],False
+
     if name:
-        rows=_eboek_find_relations(name=name,limit=10)
+        items=_eboek_find_relations(name=name,limit=10)
+        rows=_eboek_hydrate_relation_list_items(items,limit=10)
         exact=[r for r in rows if str(r.get("name") or "").strip().casefold()==name.casefold()]
-        if exact: return exact[0],False
+        if exact:
+            return exact[0],False
 
     if not name:
         raise HTTPException(status_code=400,detail="Klantnaam ontbreekt voor e-Boekhouden.")
 
-    if _eboek_load_settings().get("createMissingRelation") is False:
+    if not force_create and _eboek_load_settings().get("createMissingRelation") is False:
         raise HTTPException(
             status_code=404,
             detail="Klant bestaat nog niet in e-Boekhouden en automatisch aanmaken staat uit."
         )
 
+    cfg=_eboek_load_settings()
+    address=_eboek_payload_address_parts(payload)
+    customer_type=str(payload.get("customerType") or "").strip().lower()
+
     relation_body={
-        "type":"B",
+        "type":"P" if customer_type=="private" else "B",
         "name":name,
         "contact":str(payload.get("contactPerson") or "").strip() or None,
-        "address":str(payload.get("customerAddress") or "").strip() or None,
+        "address":address.get("address") or None,
+        "postalCode":address.get("postalCode") or None,
+        "city":address.get("city") or None,
         "phoneNumber":str(payload.get("customerPhone") or "").strip() or None,
         "emailAddress":email or None,
         "emailAddressInvoice":email or None,
-        "termOfPayment":int(_eboek_load_settings().get("paymentTermDays") or 30),
+        "termOfPayment":int(cfg.get("paymentTermDays") or 30),
     }
     relation_body={k:v for k,v in relation_body.items() if v not in (None,"")}
     created=_eboek_http("POST","/v1/relation",body=relation_body)
@@ -7098,7 +7154,7 @@ async def create_eboekhouden_invoice(quote_id: str, request: Request):
     if total<=0:
         raise HTTPException(status_code=400,detail="Het offertebedrag is € 0,00; factuur is niet aangemaakt.")
 
-    relation,created_relation=_eboek_find_or_create_relation(payload)
+    relation,created_relation=_eboek_find_or_create_relation(payload,force_create=True)
     relation_id=relation.get("id")
     if not relation_id:
         raise HTTPException(status_code=502,detail="Geen geldig e-Boekhouden relatie-ID gevonden.")
