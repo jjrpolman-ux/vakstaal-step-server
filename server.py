@@ -6787,7 +6787,21 @@ async def send_quote_email(
     }
 
 @app.post("/api/quotes/{quote_id}/eboekhouden-invoice")
-def create_eboekhouden_invoice(quote_id: str):
+async def create_eboekhouden_invoice(quote_id: str, request: Request):
+    try:
+        options=await request.json()
+        if not isinstance(options,dict):
+            options={}
+    except Exception:
+        options={}
+
+    send_email=bool(options.get("send_email"))
+    requested_recipient=str(options.get("recipient_email") or "").strip()
+    sender_email=str(options.get("sender_email") or "").strip()
+    sender_name=str(options.get("sender_name") or "Vakstaal").strip() or "Vakstaal"
+    mail_subject=str(options.get("mail_subject") or "").strip()
+    mail_body_html=str(options.get("mail_body_html") or "").strip()
+
     with _db_connect() as conn:
         quote=_quote_response(conn,quote_id)
 
@@ -6800,6 +6814,51 @@ def create_eboekhouden_invoice(quote_id: str):
     relation_id=relation.get("id")
     if not relation_id:
         raise HTTPException(status_code=502,detail="Geen geldig e-Boekhouden relatie-ID gevonden.")
+
+    invoice_recipient=""
+    if send_email:
+        invoice_recipient=(
+            requested_recipient
+            or str(payload.get("customerEmail") or "").strip()
+        )
+        if not _quote_mail_valid_email(invoice_recipient):
+            raise HTTPException(
+                status_code=400,
+                detail="Voor factuurmail ontbreekt een geldig klant-e-mailadres."
+            )
+        if not _quote_mail_valid_email(sender_email):
+            raise HTTPException(
+                status_code=400,
+                detail="Voor factuurmail ontbreekt een geldig afzender e-mailadres."
+            )
+        if not mail_subject:
+            raise HTTPException(status_code=400,detail="Onderwerp voor de factuurmail ontbreekt.")
+        if not mail_body_html:
+            raise HTTPException(status_code=400,detail="Tekst voor de factuurmail ontbreekt.")
+
+        # e-Boekhouden mailt de factuur aan het factuur-e-mailadres van de relatie.
+        # Zorg dat dit exact gelijk loopt met het e-mailadres uit de open Vakstaal-offerte.
+        current_invoice_email=str(
+            relation.get("emailAddressInvoice")
+            or relation.get("email_address_invoice")
+            or ""
+        ).strip()
+        if current_invoice_email.casefold()!=invoice_recipient.casefold():
+            relation_name=str(relation.get("name") or payload.get("customer") or "").strip()
+            if not relation_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Klantnaam ontbreekt; factuur-e-mailadres kon niet in e-Boekhouden worden bijgewerkt."
+                )
+            _eboek_http(
+                "PATCH",
+                f"/v1/relation/{int(relation_id)}",
+                body={
+                    "name":relation_name,
+                    "emailAddressInvoice":invoice_recipient,
+                }
+            )
+            relation=_eboek_get_relation(relation_id)
 
     template_id=_eboek_find_template_id()
     if not template_id:
@@ -6843,7 +6902,32 @@ def create_eboekhouden_invoice(quote_id: str):
             "checkPaymentReference":False,
         }
 
+    if send_email:
+        # De moderne e-Boekhouden REST API mailt de officiële factuur direct
+        # wanneer het `email` object bij POST /v1/invoice wordt meegestuurd.
+        # Hierdoor beheert e-Boekhouden zelf de factuur-PDF én verzendstatus.
+        invoice_body["email"]={
+            "fromEmail":sender_email,
+            "fromName":sender_name,
+            "subject":mail_subject,
+            "body":mail_body_html,
+            "attachUbl":False,
+        }
+
     invoice=_eboek_http("POST","/v1/invoice",body=invoice_body)
+
+    # GET /v1/invoice/{id} bevat o.a. de officiële deelbare PDF-url.
+    invoice_id=invoice.get("id") if isinstance(invoice,dict) else None
+    invoice_detail={}
+    if invoice_id:
+        try:
+            invoice_detail=_eboek_http("GET",f"/v1/invoice/{int(invoice_id)}")
+        except Exception as exc:
+            print(f"e-Boekhouden invoice detail {invoice_id} warning: {exc}")
+    if isinstance(invoice_detail,dict) and invoice_detail:
+        merged=dict(invoice)
+        merged.update(invoice_detail)
+        invoice=merged
 
     # Persist relation id + lifecycle-status in quote payload so future
     # invoices/searches én het klantstatusvenster exact blijven.
@@ -6852,6 +6936,39 @@ def create_eboekhouden_invoice(quote_id: str):
     payload["eboekhoudenLastInvoiceId"]=invoice.get("id")
     payload["eboekhoudenLastInvoiceNumber"]=invoice.get("invoiceNumber") or invoice.get("invoice_number") or ""
     payload["eboekhoudenInvoicedAt"]=invoiced_at
+
+    pdf_url=str(
+        invoice.get("urlPdfFile")
+        or invoice.get("url_pdf_file")
+        or ""
+    ).strip()
+    if pdf_url:
+        payload["eboekhoudenInvoicePdfUrl"]=pdf_url
+
+    if send_email:
+        payload["eboekhoudenInvoiceMailedAt"]=invoiced_at
+        payload["eboekhoudenInvoiceMailedTo"]=invoice_recipient
+        payload["eboekhoudenInvoiceMailedFrom"]=sender_email
+        payload["eboekhoudenInvoiceMailStatus"]="sent"
+        invoice_mail_history=payload.get("eboekhoudenInvoiceMailHistory")
+        if not isinstance(invoice_mail_history,list):
+            invoice_mail_history=[]
+        invoice_mail_history=[
+            item for item in invoice_mail_history
+            if isinstance(item,dict)
+        ][-19:]
+        invoice_mail_history.append({
+            "invoice_id":invoice.get("id"),
+            "invoice_number":invoice.get("invoiceNumber") or invoice.get("invoice_number") or "",
+            "sent_at":invoiced_at,
+            "recipient":invoice_recipient,
+            "sender_email":sender_email,
+            "pdf_url":pdf_url,
+            "via":"e-Boekhouden",
+            "status":"sent",
+        })
+        payload["eboekhoudenInvoiceMailHistory"]=invoice_mail_history
+
     invoice_history=payload.get("eboekhoudenInvoiceHistory")
     if not isinstance(invoice_history,list):
         invoice_history=[]
@@ -6863,6 +6980,10 @@ def create_eboekhouden_invoice(quote_id: str):
         "id":invoice.get("id"),
         "number":invoice.get("invoiceNumber") or invoice.get("invoice_number") or "",
         "invoiced_at":invoiced_at,
+        "emailed":bool(send_email),
+        "emailed_to":invoice_recipient if send_email else "",
+        "emailed_from":sender_email if send_email else "",
+        "pdf_url":pdf_url,
     })
     payload["eboekhoudenInvoiceHistory"]=invoice_history
     with _db_connect() as conn:
@@ -6880,6 +7001,11 @@ def create_eboekhouden_invoice(quote_id: str):
         "relation_created":created_relation,
         "invoice":invoice,
         "invoiced_at":invoiced_at,
+        "emailed":bool(send_email),
+        "emailed_to":invoice_recipient if send_email else "",
+        "emailed_from":sender_email if send_email else "",
+        "invoice_pdf_url":pdf_url,
+        "email_status":"sent" if send_email else "not_sent",
         "ledger_code":revenue_code,
         "template_id":template_id,
     }
