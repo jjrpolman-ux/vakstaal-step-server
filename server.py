@@ -4801,6 +4801,55 @@ def recent_quote_approvals(limit: int=20):
         return {"ok":True,"approvals":[_row_to_dict(r,cur) for r in cur.fetchall()],
                 "email_notifications_configured":_approval_email_configured()}
 
+def _machine_hours_number(value, default=0.0):
+    try:
+        number=float(value)
+        if math.isfinite(number):
+            return number
+    except Exception:
+        pass
+    return float(default)
+
+
+def _quote_production_minutes(payload: dict) -> float:
+    """Totale productietijd van één opgeslagen offerte: machinetijd + laadtijd."""
+    if not isinstance(payload, dict):
+        return 0.0
+
+    # Nieuwe offertes bewaren exact dezelfde KPI-waarde als de frontend.
+    direct=_machine_hours_number(payload.get("totalProductionMinutes"), -1)
+    if direct >= 0:
+        return max(0.0,direct)
+
+    # Bestaande offertes: de definitieve regels bevatten de naar producten
+    # verdeelde machine- en laadtijd. De som is dezelfde definitie als de
+    # zichtbare 'Totale productietijd' in de offerte.
+    lines=payload.get("committedQuoteMaterialLines")
+    if not isinstance(lines,list):
+        lines=payload.get("calculationMaterialLines")
+    if isinstance(lines,list):
+        total=0.0
+        has_time=False
+        for line in lines:
+            if not isinstance(line,dict) or line.get("enabled") is False:
+                continue
+            machine=_machine_hours_number(line.get("machineMinutes"),0)
+            loading=_machine_hours_number(line.get("loadMinutes"),0)
+            if machine>0 or loading>0:
+                has_time=True
+            total += max(0.0,machine)+max(0.0,loading)
+        if has_time:
+            return max(0.0,total)
+
+    # Legacy fallback: vóór regelgebonden laadtijd werd machinetijd als totaal
+    # bewaard. Dit is bewust de laatste fallback en wordt nooit bij nieuwere
+    # offertes gebruikt.
+    machine=_machine_hours_number(
+        payload.get("automaticMachineMinutesExact",payload.get("minutes",0)),0
+    )
+    return max(0.0,machine)
+
+
 @app.get("/api/quotes")
 def list_quotes():
     with _db_connect() as conn:
@@ -4919,6 +4968,64 @@ def list_quotes():
             "database": "postgresql" if _postgres_enabled() else "sqlite",
             "quotes": rows,
         }
+
+
+@app.get("/api/machine-production-hours")
+def machine_production_hours():
+    """Gefactureerde productie-uren, één keer per gefactureerde offerte."""
+    with _db_connect() as conn:
+        cur=conn.cursor()
+        cur.execute(
+            """
+            SELECT id, quote_number, customer_name, total_ex_vat,
+                   payload_json, created_at, updated_at
+            FROM quotes
+            ORDER BY updated_at DESC
+            """
+        )
+        rows=[_row_to_dict(r,cur) for r in cur.fetchall()]
+
+    result=[]
+    total_minutes=0.0
+    for row in rows:
+        try:
+            payload=json.loads(row.get("payload_json") or "{}")
+            if not isinstance(payload,dict):
+                payload={}
+        except Exception:
+            payload={}
+
+        invoice_id=str(payload.get("eboekhoudenLastInvoiceId") or "").strip()
+        invoice_number=str(payload.get("eboekhoudenLastInvoiceNumber") or "").strip()
+        invoiced_at=str(payload.get("eboekhoudenInvoicedAt") or "").strip()
+        if not (invoice_id or invoice_number or invoiced_at):
+            continue
+
+        minutes=_quote_production_minutes(payload)
+        total_minutes += minutes
+        result.append({
+            "id":row.get("id"),
+            "quote_number":str(row.get("quote_number") or ""),
+            "customer_name":str(row.get("customer_name") or ""),
+            "invoice_id":invoice_id,
+            "invoice_number":invoice_number,
+            "invoiced_at":invoiced_at or str(row.get("updated_at") or ""),
+            "created_at":str(row.get("created_at") or ""),
+            "updated_at":str(row.get("updated_at") or ""),
+            "production_minutes":round(minutes,6),
+            "production_hours":round(minutes/60.0,6),
+            "total_ex_vat":_machine_hours_number(row.get("total_ex_vat"),0),
+        })
+
+    result.sort(key=lambda x: x.get("invoiced_at") or "",reverse=True)
+    return {
+        "ok":True,
+        "source":"invoiced_quotes",
+        "total_minutes":round(total_minutes,6),
+        "total_hours":round(total_minutes/60.0,6),
+        "quote_count":len(result),
+        "quotes":result,
+    }
 
 
 @app.get("/api/quotes/{quote_id}")
