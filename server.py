@@ -2432,20 +2432,61 @@ def _approval_by_token(conn, token: str) -> dict:
         raise HTTPException(status_code=404, detail="Deze akkoordlink is niet geldig.")
     return row
 
-def _approval_email_configured() -> bool:
-    return all(str(os.environ.get(k) or "").strip() for k in
-               ("SMTP_HOST","SMTP_USER","SMTP_PASSWORD","QUOTE_APPROVAL_NOTIFY_EMAIL"))
+def _approval_email_settings() -> dict:
+    """Mailinstellingen voor direct akkoordbericht.
 
-def _send_approval_email(data: dict) -> bool:
-    if not _approval_email_configured():
-        return False
+    Gebruik dezelfde SMTP-configuratie als de overige Vakstaal-mailfuncties.
+    Een apart QUOTE_APPROVAL_NOTIFY_EMAIL blijft mogelijk; als dat niet is
+    ingesteld gaat de melding automatisch naar het ingestelde afzender-/loginadres.
+    """
     host=str(os.environ.get("SMTP_HOST") or "").strip()
-    port=int(os.environ.get("SMTP_PORT") or "587")
     user=str(os.environ.get("SMTP_USER") or "").strip()
     password=str(os.environ.get("SMTP_PASSWORD") or "").strip()
-    recipient=str(os.environ.get("QUOTE_APPROVAL_NOTIFY_EMAIL") or "").strip()
-    sender=str(os.environ.get("SMTP_FROM") or user).strip()
-    use_ssl=str(os.environ.get("SMTP_SSL") or "").strip().lower() in {"1","true","yes"} or port==465
+    if host and user and password:
+        port=int(os.environ.get("SMTP_PORT") or "587")
+        sender=str(os.environ.get("SMTP_FROM") or user).strip()
+        return {
+            "host":host,
+            "port":port,
+            "user":user,
+            "password":password,
+            "sender":sender or user,
+            "recipient":str(os.environ.get("QUOTE_APPROVAL_NOTIFY_EMAIL") or sender or user).strip(),
+            "ssl":str(os.environ.get("SMTP_SSL") or "").strip().lower() in {"1","true","yes"} or port==465,
+            "source":"SMTP_*",
+        }
+
+    host=str(os.environ.get("VAKSTAAL_SMTP_HOST") or "").strip()
+    user=str(os.environ.get("VAKSTAAL_SMTP_USER") or "").strip()
+    password=str(os.environ.get("VAKSTAAL_SMTP_PASSWORD") or "").strip()
+    port=int(os.environ.get("VAKSTAAL_SMTP_PORT") or "465")
+    sender=str(os.environ.get("VAKSTAAL_SMTP_FROM") or user).strip()
+    return {
+        "host":host,
+        "port":port,
+        "user":user,
+        "password":password,
+        "sender":sender or user,
+        "recipient":str(os.environ.get("QUOTE_APPROVAL_NOTIFY_EMAIL") or sender or user).strip(),
+        "ssl":str(os.environ.get("VAKSTAAL_SMTP_SSL") or "true").strip().lower() in {"1","true","yes"} or port==465,
+        "source":"VAKSTAAL_SMTP_*",
+    }
+
+def _approval_email_configured() -> bool:
+    cfg=_approval_email_settings()
+    return bool(cfg.get("host") and cfg.get("user") and cfg.get("password") and cfg.get("recipient"))
+
+def _send_approval_email(data: dict) -> bool:
+    cfg=_approval_email_settings()
+    if not (cfg.get("host") and cfg.get("user") and cfg.get("password") and cfg.get("recipient")):
+        return False
+    host=str(cfg.get("host") or "").strip()
+    port=int(cfg.get("port") or 587)
+    user=str(cfg.get("user") or "").strip()
+    password=str(cfg.get("password") or "").strip()
+    recipient=str(cfg.get("recipient") or "").strip()
+    sender=str(cfg.get("sender") or user).strip()
+    use_ssl=bool(cfg.get("ssl") or port==465)
 
     msg=EmailMessage()
     msg["Subject"]=f"Offerte {data.get('quote_number') or ''} is akkoord"
