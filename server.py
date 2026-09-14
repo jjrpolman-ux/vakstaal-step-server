@@ -2281,9 +2281,148 @@ def _quote_files(conn, quote_id: str) -> list[dict]:
     return result
 
 
-async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> list[dict]:
+_PRODUCTION_STEP_FILENAME_RE = re.compile(
+    r"^\d+x_.+_\d+(?:\.\d+)?mm_(?:(?:n2|o2)_)?(?:met|zonder)_bewerkingen\.(?:step|stp)$",
+    re.IGNORECASE,
+)
+_FILTERED_STEP_FILENAME_RE = re.compile(r"_OFFERTSELECTIE\.(?:step|stp)$", re.IGNORECASE)
+
+
+def _payload_filename_set(data: dict, key: str) -> set[str]:
+    result: set[str] = set()
+    raw = data.get(key)
+    if not isinstance(raw, list):
+        return result
+    for item in raw:
+        if isinstance(item, dict):
+            name = item.get("filename") or item.get("name")
+        else:
+            name = item
+        if name:
+            result.add(_safe_dropbox_name(str(name), "bestand").lower())
+    return result
+
+
+def _quote_file_manifest(data: dict) -> tuple[set[str], set[str], set[str]]:
+    production = _payload_filename_set(data, "production_step_files")
+    filtered = _payload_filename_set(data, "filtered_step_files")
+    sources = _payload_filename_set(data, "source_step_files")
+    step_filename = str(data.get("step_filename") or "").strip()
+    if step_filename:
+        sources.add(_safe_dropbox_name(step_filename, "bestand").lower())
+    return production, filtered, sources
+
+
+def _same_dropbox_path(a: str, b: str) -> bool:
+    return str(a or "").strip().lower() == str(b or "").strip().lower()
+
+
+def _dedupe_quote_file_rows(conn, quote_id: str) -> int:
+    """Keep only the newest DB row per filename.
+
+    Older app versions could leave duplicate PDF/STEP rows behind. Dropbox itself
+    usually contains only one file when the path is identical; only a genuinely
+    different obsolete path is deleted physically.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        _sql(
+            "SELECT id, filename, dropbox_path, created_at FROM quote_files WHERE quote_id=%s ORDER BY created_at DESC, id DESC",
+            "SELECT id, filename, dropbox_path, created_at FROM quote_files WHERE quote_id=? ORDER BY created_at DESC, id DESC",
+        ),
+        (quote_id,),
+    )
+    rows = cur.fetchall()
+    kept: dict[str, str] = {}
+    removed = 0
+    for row in rows:
+        if isinstance(row, sqlite3.Row):
+            file_id, filename, dropbox_path = row["id"], row["filename"], row["dropbox_path"]
+        else:
+            file_id, filename, dropbox_path = row[0], row[1], row[2]
+        key = str(filename or "").lower()
+        if key not in kept:
+            kept[key] = str(dropbox_path or "")
+            continue
+
+        keep_path = kept[key]
+        if dropbox_path and not _same_dropbox_path(dropbox_path, keep_path):
+            _dropbox_delete_path(str(dropbox_path))
+        cur.execute(
+            _sql("DELETE FROM quote_files WHERE id=%s", "DELETE FROM quote_files WHERE id=?"),
+            (file_id,),
+        )
+        removed += 1
+    return removed
+
+
+def _reconcile_quote_generated_steps(conn, quote_id: str, data: dict) -> list[str]:
+    """Remove obsolete generated STEP versions after quantity/geometry changes.
+
+    Production STEP filenames include the quantity (e.g. 100x_..., 120x_...).
+    Before this reconciliation every changed quantity created a new filename, so
+    old files remained visible in both the offer list and Dropbox.
+    """
+    reconcile_production = isinstance(data.get("production_step_files"), list)
+    reconcile_filtered = isinstance(data.get("filtered_step_files"), list)
+    if not reconcile_production and not reconcile_filtered:
+        return []
+
+    production, filtered, source_names = _quote_file_manifest(data)
+    removed_names: list[str] = []
+    cur = conn.cursor()
+    cur.execute(
+        _sql(
+            "SELECT id, filename, dropbox_path FROM quote_files WHERE quote_id=%s",
+            "SELECT id, filename, dropbox_path FROM quote_files WHERE quote_id=?",
+        ),
+        (quote_id,),
+    )
+    rows = cur.fetchall()
+
+    for row in rows:
+        if isinstance(row, sqlite3.Row):
+            file_id, filename, dropbox_path = row["id"], row["filename"], row["dropbox_path"]
+        else:
+            file_id, filename, dropbox_path = row[0], row[1], row[2]
+
+        safe_name = _safe_dropbox_name(str(filename or ""), "bestand")
+        key = safe_name.lower()
+        if key in source_names:
+            continue
+
+        obsolete = False
+        if reconcile_production and _PRODUCTION_STEP_FILENAME_RE.match(safe_name):
+            obsolete = key not in production
+        elif reconcile_filtered and _FILTERED_STEP_FILENAME_RE.search(safe_name):
+            obsolete = key not in filtered
+
+        if not obsolete:
+            continue
+
+        # Eerst fysiek opruimen. Als Dropbox faalt blijft de DB-rij bestaan zodat
+        # een volgende save de cleanup opnieuw kan proberen en niets stil orphaned raakt.
+        if dropbox_path:
+            _dropbox_delete_path(str(dropbox_path))
+        cur.execute(
+            _sql("DELETE FROM quote_files WHERE id=%s", "DELETE FROM quote_files WHERE id=?"),
+            (file_id,),
+        )
+        removed_names.append(safe_name)
+
+    return removed_names
+
+
+async def _store_quote_files(
+    conn,
+    quote_id: str,
+    files: list[UploadFile],
+    managed_step_names: set[str] | None = None,
+) -> list[dict]:
     quote_number, customer_name, _payload_json = _quote_identity(conn, quote_id)
     folder = _quote_dropbox_folder(quote_number, customer_name)
+    step_folder = _quote_storage_config()["step"]
+    managed_step_names = {str(name or "").lower() for name in (managed_step_names or set())}
     stored_files=[]
 
     for upload in files or []:
@@ -2300,7 +2439,7 @@ async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> li
             )
 
         kind = _file_kind(filename)
-        subfolder = _file_dropbox_subfolder(filename)
+        subfolder = step_folder if filename.lower() in managed_step_names else _file_dropbox_subfolder(filename)
         dropbox_path = f"{folder}/{subfolder}/{filename}"
 
         cur = conn.cursor()
@@ -2320,10 +2459,20 @@ async def _store_quote_files(conn, quote_id: str, files: list[UploadFile]) -> li
             (quote_id, filename)
         )
         existing = cur.fetchone()
+        old_path = ""
+        if existing:
+            old_path = str(existing["dropbox_path"] if isinstance(existing, sqlite3.Row) else existing[1] or "")
+
         # Naam en bestandsgrootte bewijzen niet dat de inhoud gelijk is.
-        # Iedere aangeleverde versie moet daarom echt worden opgeslagen.
+        # Iedere aangeleverde versie wordt daarom echt opnieuw opgeslagen.
         uploaded = _dropbox_upload_bytes(dropbox_path, data)
         actual_path = uploaded.get("path_display") or uploaded.get("path_lower") or dropbox_path
+
+        # Productie-STEP stond in oudere versies soms in 'Origineel'. Bij een
+        # nieuwe save verhuist het actuele bestand naar Productie STEP en wordt
+        # de oude fysieke kopie meteen opgeruimd.
+        if old_path and not _same_dropbox_path(old_path, actual_path):
+            _dropbox_delete_path(old_path)
 
         if existing:
             existing_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
@@ -4781,7 +4930,16 @@ async def create_quote(request: Request):
                 )
             )
 
-            stored_files=await _store_quote_files(conn, quote_id, files)
+            production_names, filtered_names, _source_names = _quote_file_manifest(data)
+            managed_step_names = production_names | filtered_names
+            stored_files=await _store_quote_files(
+                conn,
+                quote_id,
+                files,
+                managed_step_names=managed_step_names,
+            )
+            deduplicated_files=_dedupe_quote_file_rows(conn, quote_id)
+            removed_generated_files=_reconcile_quote_generated_steps(conn, quote_id, data)
 
             dropbox_warning=""
             try:
@@ -4799,6 +4957,8 @@ async def create_quote(request: Request):
             result["received_upload_count"]=len(files)
             result["stored_upload_count"]=len(stored_files)
             result["stored_uploads"]=stored_files
+            result["deduplicated_file_rows"]=deduplicated_files
+            result["removed_obsolete_generated_files"]=removed_generated_files
             return result
     finally:
         try:
@@ -4869,7 +5029,16 @@ async def update_quote(quote_id: str, request: Request):
                 )
             )
 
-            stored_files=await _store_quote_files(conn, quote_id, files)
+            production_names, filtered_names, _source_names = _quote_file_manifest(data)
+            managed_step_names = production_names | filtered_names
+            stored_files=await _store_quote_files(
+                conn,
+                quote_id,
+                files,
+                managed_step_names=managed_step_names,
+            )
+            deduplicated_files=_dedupe_quote_file_rows(conn, quote_id)
+            removed_generated_files=_reconcile_quote_generated_steps(conn, quote_id, data)
 
             dropbox_warning=""
             try:
@@ -4887,6 +5056,8 @@ async def update_quote(quote_id: str, request: Request):
             result["received_upload_count"]=len(files)
             result["stored_upload_count"]=len(stored_files)
             result["stored_uploads"]=stored_files
+            result["deduplicated_file_rows"]=deduplicated_files
+            result["removed_obsolete_generated_files"]=removed_generated_files
             return result
     finally:
         try:
