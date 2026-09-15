@@ -5141,6 +5141,51 @@ async def create_quote(request: Request):
 
 
 
+def _locked_quote_row(conn, quote_id):
+    if not _postgres_enabled():
+        conn.execute('BEGIN IMMEDIATE')
+    cur = conn.cursor()
+    cur.execute(_sql('SELECT updated_at, payload_json FROM quotes WHERE id=%s FOR UPDATE',
+                     'SELECT updated_at, payload_json FROM quotes WHERE id=?'), (quote_id,))
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail='Offerte niet gevonden.')
+    if hasattr(row, 'keys'):
+        return str(row['updated_at']), row['payload_json']
+    return str(row[0]), row[1]
+
+
+def _require_quote_revision(conn, quote_id, expected):
+    revision, _payload = _locked_quote_row(conn, quote_id)
+    if not isinstance(expected, str) or not expected or expected != revision:
+        raise HTTPException(status_code=409, detail=(
+            'Deze offerte is gewijzigd of dit concept heeft geen bekende serverversie. '
+            'Je wijzigingen blijven lokaal bewaard. Bewaar wat je wilt overnemen en '
+            'open daarna de actuele offerte uit de bibliotheek. Er is niets overschreven.'))
+    return json.loads(_payload or '{}')
+
+
+def _merge_quote_event(quote_id, original_revision, fields, history_key, event):
+    """Mail/invoice completion merges metadata into the latest quote, never old calculations."""
+    with _db_connect() as conn:
+        revision, raw = _locked_quote_row(conn, quote_id)
+        payload = json.loads(raw or '{}')
+        history_raw = payload.get(history_key)
+        history = [item for item in (history_raw if isinstance(history_raw, list) else []) if isinstance(item, dict)][-19:]
+        history.append(event)
+        payload.update(fields)
+        payload[history_key] = history
+        now = _utcnow()
+        conn.cursor().execute(
+            _sql('UPDATE quotes SET payload_json=%s,updated_at=%s WHERE id=%s',
+                 'UPDATE quotes SET payload_json=?,updated_at=? WHERE id=?'),
+            (json.dumps(payload, ensure_ascii=False), now, quote_id))
+        conn.commit()
+    # If someone changed calculations during the external action, do not grant
+    # the old browser permission to overwrite those new calculations.
+    return now if revision == str(original_revision) else None
+
+
 @app.put("/api/quotes/{quote_id}")
 async def update_quote(quote_id: str, request: Request):
     form, payload, files = await _parse_large_quote_form(request)
@@ -5154,16 +5199,13 @@ async def update_quote(quote_id: str, request: Request):
         with _db_connect() as conn:
             cur = conn.cursor()
 
-            cur.execute(
-                _sql(
-                    "SELECT id FROM quotes WHERE id=%s",
-                    "SELECT id FROM quotes WHERE id=?"
-                ),
-                (quote_id,)
-            )
-
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="Offerte niet gevonden.")
+            stored_payload = _require_quote_revision(conn, quote_id, data.pop("expected_updated_at", None))
+            # Server events are authoritative, including history absent from an old UI.
+            for key, value in stored_payload.items():
+                if (key == 'quoteMailHistory' or key.startswith('quoteLastMailed')
+                        or key.startswith('eboekhoudenInvoice') or key.startswith('eboekhoudenLastInvoice')
+                        or key == 'eboekhoudenInvoicedAt'):
+                    data[key] = value
 
             cur.execute(
                 _sql(
@@ -7215,16 +7257,10 @@ async def send_quote_email(
     payload["quoteLastMailedTo"]=recipient
     payload["quoteLastMailedFrom"]=clean_sender
 
-    with _db_connect() as conn:
-        cur=conn.cursor()
-        cur.execute(
-            _sql(
-                "UPDATE quotes SET payload_json=%s,updated_at=%s WHERE id=%s",
-                "UPDATE quotes SET payload_json=?,updated_at=? WHERE id=?"
-            ),
-            (json.dumps(payload,ensure_ascii=False),sent_at,quote_id)
-        )
-        conn.commit()
+    event_revision = _merge_quote_event(
+        quote_id, quote.get('updated_at'),
+        {key: payload[key] for key in ('quoteLastMailedAt','quoteLastMailedTo','quoteLastMailedFrom')},
+        'quoteMailHistory', history[-1])
 
     return {
         "ok": True,
@@ -7234,6 +7270,7 @@ async def send_quote_email(
         "sender_email": clean_sender,
         "filename": filename,
         "sent_at": sent_at,
+        "updated_at": event_revision,
         "mail_count": len(history),
     }
 
@@ -7437,17 +7474,16 @@ async def create_eboekhouden_invoice(quote_id: str, request: Request):
         "pdf_url":pdf_url,
     })
     payload["eboekhoudenInvoiceHistory"]=invoice_history
-    with _db_connect() as conn:
-        cur=conn.cursor()
-        cur.execute(
-            _sql("UPDATE quotes SET payload_json=%s,updated_at=%s WHERE id=%s",
-                 "UPDATE quotes SET payload_json=?,updated_at=? WHERE id=?"),
-            (json.dumps(payload,ensure_ascii=False),_utcnow(),quote_id)
-        )
-        conn.commit()
+    event_revision = _merge_quote_event(
+        quote_id, quote.get('updated_at'),
+        {key: value for key, value in payload.items()
+         if key.startswith('eboekhouden') and key != 'eboekhoudenInvoiceHistory'},
+        'eboekhoudenInvoiceHistory', invoice_history[-1])
 
     return {
         "ok":True,
+        "quote_id":quote_id,
+        "updated_at":event_revision,
         "relation":_eboek_relation_public(relation),
         "relation_created":created_relation,
         "invoice":invoice,
