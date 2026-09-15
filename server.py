@@ -3514,12 +3514,23 @@ def _parse_fs_material_lcm(content: bytes, filename: str = "") -> dict:
     elif re.search(r"aluminium|aluminum|\balu\b", source_text, re.I):
         material = "Aluminium"
 
-    # De offerte-gasregel blijft leidend voor materiaalkeuze:
-    # <=3 mm N2, >3 mm O2. GasType-enum in LCM is machinespecifiek.
-    gas = "oxygen" if (thickness is not None and thickness > 3.0) else "nitrogen"
+    # v860: de echte Cut Gas uit de LCM is de bron van waarheid.
+    # De dikteregel is alleen fallback voor oude/afwijkende LCM's zonder leesbare GasType.
+    cut_values=_lcm_decode_laser_block(data,b"Cut",b"Pierce1")
+    cut_gas_machine=_lcm_gas_name(
+        cut_values.get("GasType")
+        if cut_values.get("GasType") is not None
+        else _lcm_decode_cut_field_by_id(data,0x1D)
+    )
+    gas_code=str(cut_gas_machine or "").strip().upper()
+    if gas_code == "N2":
+        gas = "nitrogen"
+    elif gas_code == "O2":
+        gas = "oxygen"
+    else:
+        gas = "oxygen" if (thickness is not None and thickness > 3.0) else "nitrogen"
 
     advanced_parameters = _lcm_advanced_parameters(data)
-    cut_values=_lcm_decode_laser_block(data,b"Cut",b"Pierce1")
     cut_parameters=_lcm_cut_parameters_complete(data,cut_values)
     pierce_parameters=_lcm_pierce_parameters_complete(data)
     corner_parameters=_lcm_corner_parameters_complete(data)
@@ -3537,11 +3548,7 @@ def _parse_fs_material_lcm(content: bytes, filename: str = "") -> dict:
         "thicknessMm":thickness,"profile":profile,"radiusMm":radius_mm,
         "gas":gas,"nozzle":nozzle,"gasPressureBar":pressure,
         "cutSpeedMMin":speed_m_min,"workSpeedMmS":work_speed_mm_s,
-        "focusMm":focus,"cutGasMachine":_lcm_gas_name(
-            cut_values.get("GasType")
-            if cut_values.get("GasType") is not None
-            else _lcm_decode_cut_field_by_id(data,0x1D)
-        ),
+        "focusMm":focus,"cutGasMachine":cut_gas_machine,
         "cutParameters":cut_parameters,"pierceParameters":pierce_parameters,
         "cornerParameters":corner_parameters,"otherParameters":other_parameters,
         "advancedParameters":advanced_parameters,"source":"LCM import",
@@ -7869,23 +7876,18 @@ def _profile_source_dimensions(filename: str, path: str = "") -> dict:
     if not filename.lower().endswith('.sldlfp'):
         raise ValueError('Geen SLDLFP-profielbestand.')
     stem = filename[:-7].strip()
-    # Explicit shape words can occur anywhere in a folder name, e.g.
-    # "RVS - ronde buizen". Generic "buizen" is only a fallback below.
+    shape_patterns = {
+        'Vierkant': r'vierkante?(?:\s+kokers?)?|square',
+        'Rechthoek': r'rechthoek(?:ige?)?(?:\s+kokers?)?|reachthoekig(?:\s+kokers?)?|rectangular',
+        'Rond': r'ronde?(?:\s+buizen|\s+buis)?|round(?:\s+tube)?',
+        'Strip': r'strip(?:pen)?(?:\s+\d+(?:[.,]\d+)?\s*mm)?|plat(?:te)?\s*staal|flat(?:\s+bar)?',
+    }
     def shape_hint(text):
-        text = re.sub(r'[_\-]+', ' ', text.casefold())
-        patterns = {
-            'Vierkant': r'\b(?:vierkant|vierkante|square)\b',
-            'Rechthoek': r'\b(?:rechthoek|rechthoeken|rechthoekig|rechthoekige|reachthoekig|rectangular|rectangle)\b',
-            'Rond': r'\b(?:rond|ronde|round|circular)\b',
-            'Strip': r'\b(?:strip|strippen|platstaal|flat\s+bar|platte?\s+staal)\b',
-        }
-        return {shape for shape, pattern in patterns.items() if re.search(pattern, text)}
+        return {shape for shape,pattern in shape_patterns.items()
+                if re.fullmatch(pattern, text.strip(), re.IGNORECASE)}
 
-    def generic_tube(text):
-        return bool(re.search(r'\b(?:buis|buizen|tube|tubes|pipe|pipes)\b',
-                              text.replace('_', ' '), re.IGNORECASE))
-
-    prefix = re.match(r'^(ronde?\s+(?:buis|buizen)|ronde?|round(?:\s+tubes?)?|buis|buizen|tubes?|pipes?|strip(?:pen)?|plat(?:te)?\s*staal|flat(?:\s+bar)?|vierkante?(?:\s+(?:kokers?|buizen|buis))?|square(?:\s+tubes?)?|rechthoek(?:ige?)?(?:\s+(?:kokers?|buizen|buis))?|rectangular(?:\s+tubes?)?|kokers?)\s+', stem, re.IGNORECASE)
+    # Consume only known prefixes; arbitrary text such as "copy" remains a warning.
+    prefix = re.match(r'^(ronde?\s+buis|ronde?\s+buizen|ronde?|round(?:\s+tube)?|strip(?:pen)?|plat(?:te)?\s*staal|flat(?:\s+bar)?|vierkante?(?:\s+koker)?|square|rechthoek(?:ige?)?(?:\s+koker)?|rectangular|koker)\s+', stem, re.IGNORECASE)
     name_hints = shape_hint(prefix.group(1)) if prefix else set()
     dimensions = stem[prefix.end():].strip() if prefix else stem
     if dimensions.startswith(('Ø','ø','⌀')):
@@ -7896,19 +7898,13 @@ def _profile_source_dimensions(filename: str, path: str = "") -> dict:
     a,b,c,r = [float(v.replace(',', '.')) if v is not None else None for v in match.groups()]
     if any(not math.isfinite(v) or v <= 0 or v > 100000 for v in (a,b,c,r) if v is not None):
         raise ValueError('Ongeldige profielmaat.')
-    folders = PurePosixPath(path.replace('\\','/')).parts[:-1]
     folder_hints = set()
-    for folder in folders:
+    for folder in PurePosixPath(path.replace('\\','/')).parts[:-1]:
         folder_hints.update(shape_hint(folder))
     hints = folder_hints | name_hints
     if len(hints)>1:
         raise ValueError('Profielvorm in bestandsnaam en/of mappen spreekt elkaar tegen; controleer het bestand.')
     hint = next(iter(hints), None)
-    if not hint and c is None and (
-            any(generic_tube(folder) for folder in folders)
-            or (prefix and generic_tube(prefix.group(1)))):
-        hint = 'Rond'
-
     if hint == 'Strip':
         if c is not None or r is not None:
             raise ValueError('Een strip verwacht breedte x dikte, zonder derde maat of radius.')
