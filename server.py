@@ -3298,7 +3298,7 @@ def _lcm_cut_parameters_complete(data: bytes,cut_block: dict) -> dict:
         frequency=_lcm_decode_cut_field_by_id(data,0x13)
 
     return {
-        "liftHeightMm":_lcm_read_named_number(data,b"LiftHeight"),
+        "liftHeightMm":_lcm_named_number_or_ref(data,b"LiftHeight"),
         "cutHeightMm":cut_height,
         "peakPowerPct":peak_power,
         "dutyCyclePct":(float(ratio)*100.0 if isinstance(ratio,(int,float)) and abs(float(ratio))<=1.5 else ratio),
