@@ -7828,6 +7828,83 @@ async def dropbox_cut_layers_scan(request: Request):
         "files": output,
     }
 
+# Filename recognition only: no SolidWorks geometry is decoded here.
+def _profile_source_dimensions(filename: str, path: str = "") -> dict:
+    import re
+    import math
+    from pathlib import PurePosixPath
+    if not filename.lower().endswith('.sldlfp'):
+        raise ValueError('Geen SLDLFP-profielbestand.')
+    stem = filename[:-7].strip()
+    match = re.fullmatch(r'(?:[Øø⌀]\s*)?(\d+(?:[.,]\d+)?)\s*[xX×]\s*(\d+(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?(?:\s+[rR]\s*(\d+(?:[.,]\d+)?))?', stem)
+    if not match:
+        raise ValueError('Bestandsnaam niet herkend; gebruik bijvoorbeeld 15 x 15 x 1 R1,5.SLDLFP.')
+    a, b, c, r = [float(v.replace(',', '.')) if v is not None else None for v in match.groups()]
+    if any(not math.isfinite(v) or v <= 0 or v > 100000 for v in (a,b,c,r) if v is not None):
+        raise ValueError('Ongeldige profielmaat.')
+    folders = {s.casefold() for s in PurePosixPath(path).parts[:-1]}
+    hints = set()
+    if folders & {'vierkant', 'vierkante', 'square'}: hints.add('Vierkant')
+    if folders & {'rechthoekig', 'rechthoek', 'reachthoekig', 'rectangular'}: hints.add('Rechthoek')
+    if folders & {'rond', 'ronde', 'round'}: hints.add('Rond')
+    if len(hints) > 1:
+        raise ValueError('Tegenstrijdige vormnamen in de mappenstructuur.')
+    if c is None:
+        if hints != {'Rond'} and not stem.startswith(('Ø','ø','⌀')):
+            raise ValueError('Twee maten zijn alleen eenduidig met Ø of een submap Rond.')
+        shape, width, height, thickness = 'Rond', a, a, b
+        if r is not None:
+            raise ValueError('Radiusaanduiding bij een ronde buis vereist controle.')
+    else:
+        shape = 'Vierkant' if a == b else 'Rechthoek'
+        width, height, thickness = max(a,b), min(a,b), c
+    if hints and shape not in hints:
+        raise ValueError('De maten passen niet bij de vorm van de submap.')
+    if thickness * 2 >= min(width,height):
+        raise ValueError('Wanddikte is te groot voor een hol profiel.')
+    if r is not None and r > min(width,height)/2:
+        raise ValueError('Radius is groter dan de halve profielmaat.')
+    number = lambda v: format(v, '.12g')
+    size = 'x'.join(number(v) for v in ((width,thickness) if shape == 'Rond' else (width,height,thickness)))
+    return {'shape':shape, 'size':size, 'width_mm':width, 'height_mm':height,
+            'thickness_mm':thickness, 'radius_mm':r,
+            'dimension_key':shape.casefold() + ':' + size,
+            'source':'filename', 'geometry_verified':False}
+
+
+@app.post('/api/dropbox/library-sources/scan')
+async def dropbox_library_sources_scan(request: Request):
+    """Read-only source preview. Does not mutate the material library or prices."""
+    from starlette.concurrency import run_in_threadpool
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail='Ongeldig verzoek.')
+    if not isinstance(body, dict) or body.get('kind') not in ('profiles','prices'):
+        raise HTTPException(status_code=400, detail='Kies profielen of prijslijsten.')
+    if not isinstance(body.get('path'), str):
+        raise HTTPException(status_code=400, detail='Kies eerst een Dropbox-map.')
+    path = _normalize_dropbox_browser_path(body['path'])
+    if not path:
+        raise HTTPException(status_code=400, detail='Kies een submap; de volledige Dropbox wordt niet gescand.')
+    kind = body['kind']
+    files = await run_in_threadpool(_dropbox_list_files_recursive, path, '.sldlfp' if kind == 'profiles' else '')
+    if kind == 'prices':
+        files = [f for f in files if f['name'].lower().endswith(('.csv','.xlsx','.xls','.pdf'))]
+    rows = []
+    for meta in files[:1000]:
+        row = {**meta, 'status':'found'}
+        if kind == 'profiles':
+            try:
+                row['profile'] = _profile_source_dimensions(meta['name'], meta['path_display'] or meta['path_lower'])
+                row['status'] = 'recognized'
+            except ValueError as exc:
+                row.update(status='review', error=str(exc))
+        rows.append(row)
+    return {'ok':True, 'kind':kind, 'files':rows, 'file_count':len(files),
+            'truncated':len(files)>1000, 'applied':False}
+
+
 from vakstaal_auth import install_auth
 
 install_auth(app, _db_connect, _postgres_enabled)
