@@ -4345,6 +4345,210 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
     return result,parsed,changed
 
 
+
+
+def _machine_spec_output_text(payload: dict) -> str:
+    parts=[]
+    for item in payload.get("output") or []:
+        if not isinstance(item,dict) or item.get("type")!="message":
+            continue
+        for content in item.get("content") or []:
+            if isinstance(content,dict) and content.get("type")=="output_text":
+                value=content.get("text")
+                if value:
+                    parts.append(str(value))
+    return "\n".join(parts).strip()
+
+
+def _machine_spec_collect_urls(value, found=None):
+    if found is None:
+        found=set()
+    if isinstance(value,dict):
+        for k,v in value.items():
+            if str(k).lower() in {"url","source_url"} and isinstance(v,str) and v.startswith(("http://","https://")):
+                found.add(v.strip())
+            _machine_spec_collect_urls(v,found)
+    elif isinstance(value,list):
+        for item in value:
+            _machine_spec_collect_urls(item,found)
+    return found
+
+
+def _machine_spec_norm_url(raw: str) -> str:
+    try:
+        p=urllib.parse.urlsplit(str(raw or "").strip())
+        if p.scheme not in {"http","https"} or not p.netloc:
+            return ""
+        path=p.path.rstrip("/") or "/"
+        return urllib.parse.urlunsplit((p.scheme.lower(),p.netloc.lower(),path,p.query,""))
+    except Exception:
+        return ""
+
+
+def _machine_spec_extract_json(raw: str) -> dict:
+    s=str(raw or "").strip()
+    if s.startswith("```"):
+        s=re.sub(r"^```(?:json)?\s*","",s,flags=re.I)
+        s=re.sub(r"\s*```$","",s)
+    start=s.find("{")
+    end=s.rfind("}")
+    if start<0 or end<=start:
+        raise ValueError("AI response bevat geen JSON-object")
+    value=json.loads(s[start:end+1])
+    if not isinstance(value,dict):
+        raise ValueError("AI response is geen JSON-object")
+    return value
+
+
+def _machine_spec_clean_field(item, allowed_urls: set[str], *, low: float, high: float):
+    if not isinstance(item,dict):
+        return {"value":None,"source_url":"","source_title":"","evidence":"","confidence":0}
+    try:
+        value=float(str(item.get("value","")).replace(",","."))
+    except Exception:
+        value=None
+    try:
+        confidence=float(item.get("confidence") or 0)
+    except Exception:
+        confidence=0
+    source_url=str(item.get("source_url") or "").strip()
+    source_title=str(item.get("source_title") or "").strip()[:180]
+    evidence=str(item.get("evidence") or "").strip()[:500]
+    norm=_machine_spec_norm_url(source_url)
+    source_verified=(not allowed_urls) or (norm in allowed_urls)
+
+    # Alleen concrete waarden van het exacte model met een herleidbare bron.
+    if not (value is not None and math.isfinite(value) and low<=value<=high):
+        value=None
+    if confidence<0.65 or not source_verified:
+        value=None
+    return {
+        "value":value,
+        "source_url":source_url if source_verified else "",
+        "source_title":source_title,
+        "evidence":evidence,
+        "confidence":max(0,min(1,confidence)),
+        "source_verified":bool(source_verified),
+    }
+
+
+@app.post("/api/machine-specs/search")
+async def machine_specs_search(request: Request):
+    try:
+        body=await request.json()
+    except Exception:
+        body={}
+    query=re.sub(r"\s+"," ",str(body.get("query") or "")).strip()
+    if len(query)<3:
+        raise HTTPException(status_code=400,detail="Vul merk en exact machinemodel in.")
+    if len(query)>160:
+        raise HTTPException(status_code=400,detail="Machinemodel is te lang.")
+
+    api_key=str(os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Online machinezoekfunctie is nog niet geconfigureerd. Voeg OPENAI_API_KEY toe aan de serveromgeving."
+        )
+
+    model=str(os.environ.get("MACHINE_SPEC_SEARCH_MODEL") or "gpt-5.6-luna").strip()
+    prompt=f"""Zoek technische specificaties voor exact deze buis/profiellasersnijmachine: {query}
+
+Doel: vul uitsluitend de volgende vijf machine-eigenschappen wanneer ze voor dit EXACTE model expliciet uit betrouwbare online bronnen blijken:
+1. machineFeedMaxMMin = maximale Y-as/axiale buis-doorvoersnelheid in m/min
+2. machineFeedAccelMS2 = maximale Y-as/axiale acceleratie in m/s^2
+3. zAxisMaxStrokeMm = maximale Z-as slag/travel in mm
+4. zAxisMaxSpeedMmS = maximale Z-as bewegingssnelheid in mm/s
+5. zAxisAccelMS2 = maximale Z-as acceleratie in m/s^2
+
+Bronregels:
+- Fabrikantpagina, officiële datasheet of officiële handleiding heeft hoogste prioriteit.
+- Gebruik daarna pas betrouwbare dealer/distributeur-documentatie.
+- Gebruik GEEN waarde van een vergelijkbaar model, andere configuratie of andere serie.
+- Als twee betrouwbare bronnen elkaar tegenspreken: laat die waarde null en beschrijf het conflict kort.
+- Je mag alleen eenheden wiskundig converteren. Bijvoorbeeld 2 G = 19.6133 m/s^2. Vermeld de originele bronwaarde in evidence.
+- Als een bron alleen algemene machine-acceleratie noemt maar niet duidelijk Y of Z: NIET invullen.
+- Als een waarde niet expliciet vindbaar is: null. Niet schatten.
+- source_url moet de concrete pagina/PDF zijn waar de waarde staat.
+- confidence is 0..1 en mag alleen >=0.65 zijn bij een duidelijke bron voor exact dit model.
+
+Antwoord ALLEEN als geldig JSON, zonder markdown, exact in deze vorm:
+{{
+  "machine_name":"...",
+  "exact_model_match":true,
+  "fields":{{
+    "machineFeedMaxMMin":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}},
+    "machineFeedAccelMS2":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}},
+    "zAxisMaxStrokeMm":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}},
+    "zAxisMaxSpeedMmS":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}},
+    "zAxisAccelMS2":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}}
+  }},
+  "warnings":[]
+}}"""
+
+    payload={
+        "model":model,
+        "tools":[{"type":"web_search","search_context_size":"medium"}],
+        "include":["web_search_call.results"],
+        "input":prompt,
+    }
+    req=urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization":f"Bearer {api_key}",
+            "Content-Type":"application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req,timeout=75) as resp:
+            api_payload=json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail=exc.read().decode("utf-8",errors="replace")[:1500]
+        raise HTTPException(status_code=502,detail=f"Online zoekdienst gaf een fout ({exc.code}): {detail}")
+    except Exception as exc:
+        raise HTTPException(status_code=502,detail=f"Online zoeken mislukt: {exc}")
+
+    try:
+        parsed=_machine_spec_extract_json(_machine_spec_output_text(api_payload))
+    except Exception as exc:
+        raise HTTPException(status_code=502,detail=f"Zoekresultaat kon niet betrouwbaar worden gelezen: {exc}")
+
+    allowed={_machine_spec_norm_url(u) for u in _machine_spec_collect_urls(api_payload)}
+    allowed.discard("")
+    raw_fields=parsed.get("fields") if isinstance(parsed.get("fields"),dict) else {}
+    limits={
+        "machineFeedMaxMMin":(1,500),
+        "machineFeedAccelMS2":(0.1,300),
+        "zAxisMaxStrokeMm":(1,2000),
+        "zAxisMaxSpeedMmS":(1,5000),
+        "zAxisAccelMS2":(0.1,500),
+    }
+    fields={
+        key:_machine_spec_clean_field(raw_fields.get(key),allowed,low=lo,high=hi)
+        for key,(lo,hi) in limits.items()
+    }
+    exact=bool(parsed.get("exact_model_match"))
+    warnings=[str(x)[:500] for x in (parsed.get("warnings") or []) if str(x).strip()][:8]
+    if not exact:
+        warnings.insert(0,"Het exacte machinemodel kon online niet met voldoende zekerheid worden bevestigd; neem geen waarden blind over.")
+        for f in fields.values():
+            f["value"]=None
+    found=sum(1 for f in fields.values() if isinstance(f.get("value"),(int,float)))
+    if found<5:
+        warnings.append(f"{5-found} van de 5 gevraagde machinewaarden zijn bewust leeg gelaten omdat er geen voldoende betrouwbare, exacte bron is gevonden.")
+
+    return {
+        "query":query,
+        "machine_name":str(parsed.get("machine_name") or query)[:180],
+        "exact_model_match":exact,
+        "fields":fields,
+        "warnings":warnings,
+        "provider":"OpenAI web search",
+        "model":model,
+    }
+
 @app.post("/api/cut-layer/build-machine")
 # v695 — simplified koker layer writer: exact editable Cut/Corner set with round-trip validation.
 async def build_machine_cut_layer(request: Request):
