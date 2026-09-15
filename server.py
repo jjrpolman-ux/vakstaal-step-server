@@ -7830,46 +7830,67 @@ async def dropbox_cut_layers_scan(request: Request):
 
 # Filename recognition only: no SolidWorks geometry is decoded here.
 def _profile_source_dimensions(filename: str, path: str = "") -> dict:
+    """Recognize explicit profile names and folder hints, never infer geometry."""
     import re
     import math
     from pathlib import PurePosixPath
     if not filename.lower().endswith('.sldlfp'):
         raise ValueError('Geen SLDLFP-profielbestand.')
     stem = filename[:-7].strip()
-    match = re.fullmatch(r'(?:[Øø⌀]\s*)?(\d+(?:[.,]\d+)?)\s*[xX×]\s*(\d+(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?(?:\s+[rR]\s*(\d+(?:[.,]\d+)?))?', stem)
+    shape_patterns = {
+        'Vierkant': r'vierkante?(?:\s+kokers?)?|square',
+        'Rechthoek': r'rechthoek(?:ige?)?(?:\s+kokers?)?|reachthoekig(?:\s+kokers?)?|rectangular',
+        'Rond': r'ronde?(?:\s+buizen|\s+buis)?|round(?:\s+tube)?',
+        'Strip': r'strip(?:pen)?(?:\s+\d+(?:[.,]\d+)?\s*mm)?|plat(?:te)?\s*staal|flat(?:\s+bar)?',
+    }
+    def shape_hint(text):
+        return {shape for shape,pattern in shape_patterns.items()
+                if re.fullmatch(pattern, text.strip(), re.IGNORECASE)}
+
+    # Consume only known prefixes; arbitrary text such as "copy" remains a warning.
+    prefix = re.match(r'^(ronde?\s+buis|ronde?\s+buizen|ronde?|round(?:\s+tube)?|strip(?:pen)?|plat(?:te)?\s*staal|flat(?:\s+bar)?|vierkante?(?:\s+koker)?|square|rechthoek(?:ige?)?(?:\s+koker)?|rectangular|koker)\s+', stem, re.IGNORECASE)
+    name_hints = shape_hint(prefix.group(1)) if prefix else set()
+    dimensions = stem[prefix.end():].strip() if prefix else stem
+    if dimensions.startswith(('Ø','ø','⌀')):
+        name_hints.add('Rond')
+    match = re.fullmatch(r'(?:[Øø⌀]\s*)?(\d+(?:[.,]\d+)?)\s*[xX×]\s*(\d+(?:[.,]\d+)?)(?:\s*[xX×]\s*(\d+(?:[.,]\d+)?))?(?:\s*mm)?(?:\s*[rR]\s*(\d+(?:[.,]\d+)?)(?:\s*mm)?)?', dimensions)
     if not match:
-        raise ValueError('Bestandsnaam niet herkend; gebruik bijvoorbeeld 15 x 15 x 1 R1,5.SLDLFP.')
-    a, b, c, r = [float(v.replace(',', '.')) if v is not None else None for v in match.groups()]
+        raise ValueError('Naam niet herkend; gebruik bijvoorbeeld Ronde buis 101,6x3,6, strip 30x5 of 15x15x1 R1,5.')
+    a,b,c,r = [float(v.replace(',', '.')) if v is not None else None for v in match.groups()]
     if any(not math.isfinite(v) or v <= 0 or v > 100000 for v in (a,b,c,r) if v is not None):
         raise ValueError('Ongeldige profielmaat.')
-    folders = {s.casefold() for s in PurePosixPath(path).parts[:-1]}
-    hints = set()
-    if folders & {'vierkant', 'vierkante', 'square'}: hints.add('Vierkant')
-    if folders & {'rechthoekig', 'rechthoek', 'reachthoekig', 'rectangular'}: hints.add('Rechthoek')
-    if folders & {'rond', 'ronde', 'round'}: hints.add('Rond')
-    if len(hints) > 1:
-        raise ValueError('Tegenstrijdige vormnamen in de mappenstructuur.')
-    if c is None:
-        if hints != {'Rond'} and not stem.startswith(('Ø','ø','⌀')):
-            raise ValueError('Twee maten zijn alleen eenduidig met Ø of een submap Rond.')
-        shape, width, height, thickness = 'Rond', a, a, b
+    folder_hints = set()
+    for folder in PurePosixPath(path.replace('\\','/')).parts[:-1]:
+        folder_hints.update(shape_hint(folder))
+    hints = folder_hints | name_hints
+    if len(hints)>1:
+        raise ValueError('Profielvorm in bestandsnaam en/of mappen spreekt elkaar tegen; controleer het bestand.')
+    hint = next(iter(hints), None)
+    if hint == 'Strip':
+        if c is not None or r is not None:
+            raise ValueError('Een strip verwacht breedte x dikte, zonder derde maat of radius.')
+        shape,width,height,thickness = 'Strip',max(a,b),min(a,b),min(a,b)
+    elif c is None:
+        if hint != 'Rond':
+            raise ValueError('Twee maten zijn niet eenduidig: vermeld Ronde buis of Strip in de naam of map.')
+        shape,width,height,thickness = 'Rond',a,a,b
         if r is not None:
             raise ValueError('Radiusaanduiding bij een ronde buis vereist controle.')
     else:
         shape = 'Vierkant' if a == b else 'Rechthoek'
-        width, height, thickness = max(a,b), min(a,b), c
-    if hints and shape not in hints:
-        raise ValueError('De maten passen niet bij de vorm van de submap.')
-    if thickness * 2 >= min(width,height):
+        width,height,thickness = max(a,b),min(a,b),c
+    if hint and shape != hint:
+        raise ValueError('De maten passen niet bij de opgegeven profielvorm.')
+    if shape != 'Strip' and thickness*2 >= min(width,height):
         raise ValueError('Wanddikte is te groot voor een hol profiel.')
     if r is not None and r > min(width,height)/2:
         raise ValueError('Radius is groter dan de halve profielmaat.')
     number = lambda v: format(v, '.12g')
-    size = 'x'.join(number(v) for v in ((width,thickness) if shape == 'Rond' else (width,height,thickness)))
-    return {'shape':shape, 'size':size, 'width_mm':width, 'height_mm':height,
-            'thickness_mm':thickness, 'radius_mm':r,
-            'dimension_key':shape.casefold() + ':' + size,
-            'source':'filename', 'geometry_verified':False}
+    size = 'x'.join(number(v) for v in ((width,thickness) if shape in ('Rond','Strip') else (width,height,thickness)))
+    return {'shape':shape,'size':size,'width_mm':width,'height_mm':height,
+            'thickness_mm':thickness,'radius_mm':r,'is_solid':shape=='Strip',
+            'dimension_key':shape.casefold()+':'+size,
+            'source':'filename','geometry_verified':False}
 
 
 @app.post('/api/dropbox/library-sources/scan')
