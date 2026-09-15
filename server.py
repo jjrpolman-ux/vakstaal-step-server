@@ -4432,6 +4432,488 @@ def _machine_spec_clean_field(item, allowed_urls: set[str], *, low: float, high:
     }
 
 
+_MACHINE_SPEC_SEARCH_CACHE={}
+_MACHINE_SPEC_SEARCH_TTL_S=15*60
+_MACHINE_SPEC_USER_AGENT=(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0 Safari/537.36"
+)
+
+
+def _machine_spec_query_identity(query: str) -> tuple[str,str]:
+    tokens=re.findall(r"[A-Za-z0-9][A-Za-z0-9._/-]*",str(query or ""))
+    brand=tokens[0] if tokens else ""
+    model_candidates=[t for t in tokens if re.search(r"[A-Za-z]",t) and re.search(r"\d",t)]
+    model=max(model_candidates,key=lambda x:len(re.sub(r"[^A-Za-z0-9]","",x))) if model_candidates else ""
+    if not model and len(tokens)>1:
+        model="".join(tokens[1:])
+    norm_model=re.sub(r"[^A-Za-z0-9]","",model).upper()
+    return brand,norm_model
+
+
+def _machine_spec_safe_public_url(raw: str) -> str:
+    try:
+        p=urllib.parse.urlsplit(str(raw or "").strip())
+        if p.scheme not in {"http","https"} or not p.hostname:
+            return ""
+        host=p.hostname.strip().lower()
+        if host in {"localhost","localhost.localdomain"} or host.endswith(".local"):
+            return ""
+        # Letterlijke private/local IP-adressen nooit ophalen.
+        try:
+            import ipaddress
+            ip=ipaddress.ip_address(host.strip("[]"))
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return ""
+        except ValueError:
+            pass
+        return urllib.parse.urlunsplit((p.scheme,p.netloc,p.path,p.query,""))
+    except Exception:
+        return ""
+
+
+def _machine_spec_http_get(url: str, *, timeout: int=14, max_bytes: int=12_000_000):
+    safe=_machine_spec_safe_public_url(url)
+    if not safe:
+        raise ValueError("Ongeldige of niet-openbare bron-URL")
+    req=urllib.request.Request(
+        safe,
+        headers={
+            "User-Agent":_MACHINE_SPEC_USER_AGENT,
+            "Accept":"text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.5",
+            "Accept-Language":"nl-NL,nl;q=0.8,en-US;q=0.7,en;q=0.6",
+            "Cache-Control":"no-cache",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req,timeout=timeout) as resp:
+        final_url=_machine_spec_safe_public_url(resp.geturl())
+        if not final_url:
+            raise ValueError("Bron stuurde door naar een niet-openbare URL")
+        content_type=str(resp.headers.get("Content-Type") or "").lower()
+        length=resp.headers.get("Content-Length")
+        if length:
+            try:
+                parsed_length=int(length)
+            except (TypeError,ValueError):
+                parsed_length=0
+            if parsed_length>max_bytes:
+                raise ValueError("Bronbestand is te groot om veilig te controleren")
+        data=resp.read(max_bytes+1)
+        if len(data)>max_bytes:
+            raise ValueError("Bronbestand is te groot om veilig te controleren")
+        return final_url,content_type,data
+
+
+def _machine_spec_strip_html(raw: bytes) -> tuple[str,str]:
+    text=raw.decode("utf-8",errors="replace")
+    title=""
+    m=re.search(r"(?is)<title[^>]*>(.*?)</title>",text)
+    if m:
+        title=html.unescape(re.sub(r"(?s)<[^>]+>"," ",m.group(1)))
+        title=re.sub(r"\s+"," ",title).strip()[:220]
+    text=re.sub(r"(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>"," ",text)
+    text=re.sub(r"(?i)<br\s*/?>|</(?:p|div|li|tr|td|th|h[1-6]|section|article)\s*>","\n",text)
+    text=re.sub(r"(?s)<[^>]+>"," ",text)
+    text=html.unescape(text).replace("\xa0"," ")
+    lines=[]
+    for line in text.splitlines():
+        line=re.sub(r"[ \t\r\f\v]+"," ",line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)[:350_000],title
+
+
+def _machine_spec_pdf_text(raw: bytes) -> str:
+    try:
+        import io
+        from pypdf import PdfReader
+        reader=PdfReader(io.BytesIO(raw),strict=False)
+        parts=[]
+        total=0
+        for page in reader.pages[:60]:
+            try:
+                value=page.extract_text() or ""
+            except Exception:
+                value=""
+            if value:
+                parts.append(value)
+                total+=len(value)
+            if total>=300_000:
+                break
+        return "\n".join(parts)[:350_000]
+    except Exception:
+        return ""
+
+
+def _machine_spec_unwrap_ddg_url(raw: str) -> str:
+    href=html.unescape(str(raw or "").strip())
+    if href.startswith("//"):
+        href="https:"+href
+    try:
+        p=urllib.parse.urlsplit(href)
+        if "duckduckgo.com" in (p.hostname or "").lower():
+            qs=urllib.parse.parse_qs(p.query)
+            target=(qs.get("uddg") or [""])[0]
+            if target:
+                href=urllib.parse.unquote(target)
+    except Exception:
+        pass
+    return _machine_spec_safe_public_url(href)
+
+
+def _machine_spec_ddg_results(search_html: bytes, limit: int=10):
+    source=search_html.decode("utf-8",errors="replace")
+    results=[]
+    # DuckDuckGo HTML gebruikt result__a voor de echte resultaatlink.
+    for m in re.finditer(r"(?is)<a\b([^>]*class=[\"'][^\"']*result__a[^\"']*[\"'][^>]*)>(.*?)</a>",source):
+        attrs=m.group(1)
+        hm=re.search(r"(?is)href\s*=\s*[\"']([^\"']+)[\"']",attrs)
+        if not hm:
+            continue
+        url=_machine_spec_unwrap_ddg_url(hm.group(1))
+        if not url:
+            continue
+        title=html.unescape(re.sub(r"(?s)<[^>]+>"," ",m.group(2)))
+        title=re.sub(r"\s+"," ",title).strip()[:220]
+        if url not in {x["url"] for x in results}:
+            results.append({"url":url,"title":title,"rank":len(results)+1})
+        if len(results)>=limit:
+            break
+    return results
+
+
+def _machine_spec_bing_results(search_html: bytes, limit: int=10):
+    source=search_html.decode("utf-8",errors="replace")
+    results=[]
+    for m in re.finditer(r"(?is)<li[^>]*class=[\"'][^\"']*b_algo[^\"']*[\"'][^>]*>.*?<h2[^>]*>\s*<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",source):
+        url=_machine_spec_safe_public_url(html.unescape(m.group(1)))
+        if not url:
+            continue
+        title=html.unescape(re.sub(r"(?s)<[^>]+>"," ",m.group(2)))
+        title=re.sub(r"\s+"," ",title).strip()[:220]
+        if url not in {x["url"] for x in results}:
+            results.append({"url":url,"title":title,"rank":len(results)+1})
+        if len(results)>=limit:
+            break
+    return results
+
+
+def _machine_spec_public_search(query: str, limit: int=10):
+    encoded=urllib.parse.quote_plus(query)
+    errors=[]
+    # Eerste keuze: lichte DuckDuckGo HTML-interface, zonder API-sleutel.
+    try:
+        url=f"https://html.duckduckgo.com/html/?q={encoded}"
+        _,_,raw=_machine_spec_http_get(url,timeout=12,max_bytes=2_500_000)
+        found=_machine_spec_ddg_results(raw,limit=limit)
+        if found:
+            return found,"DuckDuckGo"
+    except Exception as exc:
+        errors.append(f"DuckDuckGo: {exc}")
+
+    # Fallback: gewone Bing-resultatenpagina. Ook hiervoor is geen API-sleutel nodig.
+    try:
+        url=f"https://www.bing.com/search?q={encoded}&count={max(5,min(20,limit))}"
+        _,_,raw=_machine_spec_http_get(url,timeout=12,max_bytes=2_500_000)
+        found=_machine_spec_bing_results(raw,limit=limit)
+        if found:
+            return found,"Bing"
+    except Exception as exc:
+        errors.append(f"Bing: {exc}")
+
+    raise RuntimeError("; ".join(errors) or "Geen openbare zoekresultaten ontvangen")
+
+
+def _machine_spec_source_score(source: dict, brand: str, model_key: str) -> float:
+    url=str(source.get("url") or "")
+    title=str(source.get("title") or "")
+    text=str(source.get("text") or "")
+    try:
+        host=(urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:
+        host=""
+    hay=(title+" "+url+" "+text[:30_000]).lower()
+    score=0.0
+    compact=re.sub(r"[^A-Za-z0-9]","",title+" "+text[:80_000]).upper()
+    if model_key and model_key in compact:
+        score+=5.0
+    brand_l=str(brand or "").lower()
+    if brand_l and (brand_l in host or brand_l in title.lower()):
+        score+=2.0
+    if url.lower().endswith(".pdf") or "application/pdf" in str(source.get("content_type") or ""):
+        score+=1.5
+    if any(k in hay for k in ("manual","datasheet","data sheet","specification","specifications","technical","parameter")):
+        score+=1.2
+    if any(k in host for k in ("youtube.","facebook.","instagram.","pinterest.","alibaba.","made-in-china.","ebay.")):
+        score-=2.0
+    return score
+
+
+_MACHINE_SPEC_QUANTITY_RE=re.compile(
+    r"(?P<value>\d{1,6}(?:[\.,]\d{1,5})?)\s*"
+    r"(?P<unit>mm\s*/\s*s(?:\s*(?:\^?2|²))?|m\s*/\s*s(?:\s*(?:\^?2|²))?|"
+    r"mm\s*/\s*min|m\s*/\s*min|mm\s*/\s*s|m\s*/\s*s|g\b|mm\b|cm\b)",
+    re.I,
+)
+
+
+def _machine_spec_unit_norm(unit: str) -> str:
+    u=str(unit or "").lower().replace(" ","").replace("²","2").replace("^","")
+    return u
+
+
+def _machine_spec_convert_quantity(value: float, unit: str, kind: str):
+    u=_machine_spec_unit_norm(unit)
+    if kind=="y_speed_mmin":
+        if u=="m/min": return value
+        if u=="mm/min": return value/1000.0
+        if u=="mm/s": return value*60.0/1000.0
+        if u=="m/s": return value*60.0
+    elif kind=="z_speed_mms":
+        if u=="mm/s": return value
+        if u=="m/s": return value*1000.0
+        if u=="m/min": return value*1000.0/60.0
+        if u=="mm/min": return value/60.0
+    elif kind=="accel_ms2":
+        if u=="g": return value*9.80665
+        if u=="m/s2": return value
+        if u=="mm/s2": return value/1000.0
+    elif kind=="stroke_mm":
+        if u=="mm": return value
+        if u=="cm": return value*10.0
+    return None
+
+
+_MACHINE_SPEC_FIELD_RULES={
+    "machineFeedMaxMMin":{
+        "kind":"y_speed_mmin","bounds":(1,500),"tolerance":0.04,
+        "patterns":[
+            r"\b(?:y\s*[- ]?\s*axis|axis\s*y)\b[^|]{0,55}\b(?:max(?:imum)?\s*)?(?:speed|velocity|rapid(?:\s*speed)?|feed(?:ing)?\s*speed)\b",
+            r"\b(?:max(?:imum)?\s*)?(?:speed|velocity|rapid(?:\s*speed)?|feed(?:ing)?\s*speed)\b[^|]{0,55}\b(?:y\s*[- ]?\s*axis|axis\s*y)\b",
+            r"\by\b[^|]{0,24}\b(?:max(?:imum)?\s*)?(?:speed|velocity|rapid)\b",
+        ]
+    },
+    "machineFeedAccelMS2":{
+        "kind":"accel_ms2","bounds":(0.1,300),"tolerance":0.08,
+        "patterns":[
+            r"\b(?:y\s*[- ]?\s*axis|axis\s*y)\b[^|]{0,55}\b(?:max(?:imum)?\s*)?accel(?:eration)?\b",
+            r"\b(?:max(?:imum)?\s*)?accel(?:eration)?\b[^|]{0,55}\b(?:y\s*[- ]?\s*axis|axis\s*y)\b",
+            r"\by\b[^|]{0,24}\baccel(?:eration)?\b",
+        ]
+    },
+    "zAxisMaxStrokeMm":{
+        "kind":"stroke_mm","bounds":(1,2000),"tolerance":0.03,
+        "patterns":[
+            r"\b(?:z\s*[- ]?\s*axis|axis\s*z)\b[^|]{0,55}\b(?:travel|stroke|range|movement|moving\s*range)\b",
+            r"\b(?:travel|stroke|range|movement|moving\s*range)\b[^|]{0,55}\b(?:z\s*[- ]?\s*axis|axis\s*z)\b",
+            r"\bz\b[^|]{0,24}\b(?:travel|stroke|range)\b",
+        ]
+    },
+    "zAxisMaxSpeedMmS":{
+        "kind":"z_speed_mms","bounds":(1,5000),"tolerance":0.04,
+        "patterns":[
+            r"\b(?:z\s*[- ]?\s*axis|axis\s*z)\b[^|]{0,55}\b(?:max(?:imum)?\s*)?(?:speed|velocity|rapid(?:\s*speed)?)\b",
+            r"\b(?:max(?:imum)?\s*)?(?:speed|velocity|rapid(?:\s*speed)?)\b[^|]{0,55}\b(?:z\s*[- ]?\s*axis|axis\s*z)\b",
+            r"\bz\b[^|]{0,24}\b(?:max(?:imum)?\s*)?(?:speed|velocity|rapid)\b",
+        ]
+    },
+    "zAxisAccelMS2":{
+        "kind":"accel_ms2","bounds":(0.1,500),"tolerance":0.08,
+        "patterns":[
+            r"\b(?:z\s*[- ]?\s*axis|axis\s*z)\b[^|]{0,55}\b(?:max(?:imum)?\s*)?accel(?:eration)?\b",
+            r"\b(?:max(?:imum)?\s*)?accel(?:eration)?\b[^|]{0,55}\b(?:z\s*[- ]?\s*axis|axis\s*z)\b",
+            r"\bz\b[^|]{0,24}\baccel(?:eration)?\b",
+        ]
+    },
+}
+
+
+def _machine_spec_extract_candidates(source: dict, field_key: str):
+    rule=_MACHINE_SPEC_FIELD_RULES[field_key]
+    text=str(source.get("text") or "")
+    lines=[re.sub(r"\s+"," ",x).strip() for x in text.splitlines() if x.strip()]
+    # Tabellen verliezen bij HTML/PDF soms celgrenzen; kijk daarom ook één regel voor/na de match.
+    windows=[]
+    for i,line in enumerate(lines):
+        windows.append(line)
+        if i+1<len(lines): windows.append(line+" | "+lines[i+1])
+        if i>0: windows.append(lines[i-1]+" | "+line)
+    seen=set()
+    out=[]
+    for window in windows:
+        low_window=window.lower()
+        for pat in rule["patterns"]:
+            alias=re.search(pat,low_window,re.I)
+            if not alias:
+                continue
+            quantities=[]
+            for qm in _MACHINE_SPEC_QUANTITY_RE.finditer(window):
+                try:
+                    raw_value=float(qm.group("value").replace(",","."))
+                except Exception:
+                    continue
+                converted=_machine_spec_convert_quantity(raw_value,qm.group("unit"),rule["kind"])
+                if converted is None or not math.isfinite(converted):
+                    continue
+                lo,hi=rule["bounds"]
+                if not (lo<=converted<=hi):
+                    continue
+                distance=abs(((qm.start()+qm.end())/2)-((alias.start()+alias.end())/2))
+                quantities.append((distance,converted,raw_value,qm.group("unit"),qm.group(0)))
+            if not quantities:
+                continue
+            # Technische tabellen schrijven vrijwel altijd label -> waarde. Geef
+            # daarom een hoeveelheid ná het gevonden veldlabel voorrang; dit voorkomt
+            # dat bij samengevoegde tabelregels bijvoorbeeld de Y-acceleratie als
+            # Z-acceleratie wordt meegenomen. Alleen als er rechts niets staat, mag
+            # de dichtstbijzijnde waarde links van het label gebruikt worden.
+            after=[]
+            for q in quantities:
+                token=str(q[4])
+                pos=window.find(token)
+                if pos>=max(0,alias.end()-3):
+                    after.append(q)
+            pool=after or quantities
+            pool.sort(key=lambda x:x[0])
+            _,value,raw_value,raw_unit,raw_token=pool[0]
+            marker=(round(value,6),window[:220])
+            if marker in seen:
+                continue
+            seen.add(marker)
+            evidence=window[:420]
+            if abs(value-raw_value)>1e-9 or _machine_spec_unit_norm(raw_unit) not in {"m/min","m/s2","mm","mm/s"}:
+                evidence+=f" · omgerekend uit {raw_token.strip()}"
+            source_score=float(source.get("score") or 0)
+            confidence=max(0.65,min(0.97,0.68+0.035*source_score))
+            out.append({
+                "value":value,
+                "source_url":source.get("url") or "",
+                "source_title":source.get("title") or source.get("url") or "",
+                "evidence":evidence,
+                "confidence":confidence,
+                "source_verified":True,
+                "source_score":source_score,
+            })
+    return out
+
+
+def _machine_spec_resolve_candidates(field_key: str, candidates: list[dict]):
+    if not candidates:
+        return {"value":None,"source_url":"","source_title":"","evidence":"","confidence":0,"source_verified":False},None
+    # Zelfde URL/waarde maar één keer meenemen.
+    unique=[]
+    seen=set()
+    for c in sorted(candidates,key=lambda x:(float(x.get("source_score") or 0),float(x.get("confidence") or 0)),reverse=True):
+        marker=(_machine_spec_norm_url(c.get("source_url") or ""),round(float(c.get("value") or 0),5))
+        if marker in seen: continue
+        seen.add(marker); unique.append(c)
+    best=unique[0]
+    tol=float(_MACHINE_SPEC_FIELD_RULES[field_key]["tolerance"])
+    conflicts=[]
+    for other in unique[1:]:
+        bv=float(best["value"]); ov=float(other["value"])
+        rel=abs(bv-ov)/max(abs(bv),abs(ov),1e-9)
+        if rel>tol and float(other.get("source_score") or 0)>=float(best.get("source_score") or 0)-1.5:
+            conflicts.append(other)
+    if conflicts:
+        values=[best]+conflicts[:3]
+        summary="; ".join(
+            f"{round(float(c['value']),4)} ({urllib.parse.urlsplit(c.get('source_url') or '').hostname or 'bron'})"
+            for c in values
+        )
+        return {"value":None,"source_url":"","source_title":"","evidence":"","confidence":0,"source_verified":False},f"Tegenstrijdige bronnen voor {field_key}: {summary}. Waarde daarom niet automatisch ingevuld."
+    return {
+        "value":round(float(best["value"]),6),
+        "source_url":str(best.get("source_url") or ""),
+        "source_title":str(best.get("source_title") or "")[:180],
+        "evidence":str(best.get("evidence") or "")[:500],
+        "confidence":max(0,min(1,float(best.get("confidence") or 0))),
+        "source_verified":True,
+    },None
+
+
+def _machine_spec_fetch_sources(query: str):
+    brand,model_key=_machine_spec_query_identity(query)
+    if not model_key:
+        raise HTTPException(status_code=400,detail="Vul naast het merk ook het exacte machinemodel in.")
+    searches=[
+        f'"{query}" manual specifications Y axis Z axis',
+        f'"{query}" Y axis speed acceleration Z axis travel speed acceleration',
+        f'"{query}" datasheet pdf',
+    ]
+    merged=[]
+    providers=[]
+    seen=set()
+    for q in searches:
+        try:
+            found,provider=_machine_spec_public_search(q,limit=8)
+            providers.append(provider)
+        except Exception:
+            continue
+        for item in found:
+            url=_machine_spec_norm_url(item.get("url") or "")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            merged.append(item)
+        if len(merged)>=14:
+            break
+    if not merged:
+        raise HTTPException(
+            status_code=502,
+            detail="De openbare webzoekopdracht leverde geen resultaten op. Controleer de internettoegang van de server en probeer opnieuw."
+        )
+
+    # Eerst waarschijnlijk relevante/technische resultaten ophalen.
+    brand_l=brand.lower()
+    def prelim(item):
+        hay=(str(item.get("title") or "")+" "+str(item.get("url") or "")).lower()
+        s=0
+        if brand_l and brand_l in hay: s+=2
+        if str(item.get("url") or "").lower().endswith(".pdf"): s+=2
+        if any(k in hay for k in ("manual","datasheet","spec","parameter","technical")): s+=1
+        return (-s,int(item.get("rank") or 99))
+    merged.sort(key=prelim)
+
+    sources=[]
+    fetch_errors=[]
+    for item in merged[:10]:
+        url=item.get("url") or ""
+        try:
+            final_url,content_type,raw=_machine_spec_http_get(url,timeout=14,max_bytes=12_000_000)
+            title=str(item.get("title") or "")
+            if "pdf" in content_type or final_url.lower().endswith(".pdf") or raw[:5]==b"%PDF-":
+                page_text=_machine_spec_pdf_text(raw)
+            else:
+                page_text,page_title=_machine_spec_strip_html(raw)
+                if page_title: title=page_title
+            if not page_text:
+                continue
+            compact=re.sub(r"[^A-Za-z0-9]","",title+" "+page_text[:120_000]).upper()
+            exact=bool(model_key and model_key in compact)
+            source={
+                "url":final_url,
+                "title":title[:220] or final_url,
+                "content_type":content_type,
+                "text":page_text,
+                "exact_model":exact,
+            }
+            source["score"]=_machine_spec_source_score(source,brand,model_key)
+            sources.append(source)
+        except Exception as exc:
+            fetch_errors.append(f"{urllib.parse.urlsplit(url).hostname or url}: {exc}")
+
+    exact_sources=[s for s in sources if s.get("exact_model")]
+    if not exact_sources:
+        raise HTTPException(
+            status_code=404,
+            detail="Er zijn wel zoekresultaten gevonden, maar geen gecontroleerde bron waarin het exacte machinemodel duidelijk voorkomt. Er worden daarom geen waarden ingevuld."
+        )
+    exact_sources.sort(key=lambda s:float(s.get("score") or 0),reverse=True)
+    return brand,model_key,exact_sources,sorted(set(providers)),fetch_errors
+
+
 @app.post("/api/machine-specs/search")
 async def machine_specs_search(request: Request):
     try:
@@ -4444,110 +4926,53 @@ async def machine_specs_search(request: Request):
     if len(query)>160:
         raise HTTPException(status_code=400,detail="Machinemodel is te lang.")
 
-    api_key=str(os.environ.get("OPENAI_API_KEY") or "").strip()
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="Online machinezoekfunctie is nog niet geconfigureerd. Voeg OPENAI_API_KEY toe aan de serveromgeving."
-        )
-
-    model=str(os.environ.get("MACHINE_SPEC_SEARCH_MODEL") or "gpt-5.6-luna").strip()
-    prompt=f"""Zoek technische specificaties voor exact deze buis/profiellasersnijmachine: {query}
-
-Doel: vul uitsluitend de volgende vijf machine-eigenschappen wanneer ze voor dit EXACTE model expliciet uit betrouwbare online bronnen blijken:
-1. machineFeedMaxMMin = maximale Y-as/axiale buis-doorvoersnelheid in m/min
-2. machineFeedAccelMS2 = maximale Y-as/axiale acceleratie in m/s^2
-3. zAxisMaxStrokeMm = maximale Z-as slag/travel in mm
-4. zAxisMaxSpeedMmS = maximale Z-as bewegingssnelheid in mm/s
-5. zAxisAccelMS2 = maximale Z-as acceleratie in m/s^2
-
-Bronregels:
-- Fabrikantpagina, officiële datasheet of officiële handleiding heeft hoogste prioriteit.
-- Gebruik daarna pas betrouwbare dealer/distributeur-documentatie.
-- Gebruik GEEN waarde van een vergelijkbaar model, andere configuratie of andere serie.
-- Als twee betrouwbare bronnen elkaar tegenspreken: laat die waarde null en beschrijf het conflict kort.
-- Je mag alleen eenheden wiskundig converteren. Bijvoorbeeld 2 G = 19.6133 m/s^2. Vermeld de originele bronwaarde in evidence.
-- Als een bron alleen algemene machine-acceleratie noemt maar niet duidelijk Y of Z: NIET invullen.
-- Als een waarde niet expliciet vindbaar is: null. Niet schatten.
-- source_url moet de concrete pagina/PDF zijn waar de waarde staat.
-- confidence is 0..1 en mag alleen >=0.65 zijn bij een duidelijke bron voor exact dit model.
-
-Antwoord ALLEEN als geldig JSON, zonder markdown, exact in deze vorm:
-{{
-  "machine_name":"...",
-  "exact_model_match":true,
-  "fields":{{
-    "machineFeedMaxMMin":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}},
-    "machineFeedAccelMS2":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}},
-    "zAxisMaxStrokeMm":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}},
-    "zAxisMaxSpeedMmS":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}},
-    "zAxisAccelMS2":{{"value":null,"source_url":"","source_title":"","evidence":"","confidence":0}}
-  }},
-  "warnings":[]
-}}"""
-
-    payload={
-        "model":model,
-        "tools":[{"type":"web_search","search_context_size":"medium"}],
-        "include":["web_search_call.results"],
-        "input":prompt,
-    }
-    req=urllib.request.Request(
-        "https://api.openai.com/v1/responses",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization":f"Bearer {api_key}",
-            "Content-Type":"application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req,timeout=75) as resp:
-            api_payload=json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail=exc.read().decode("utf-8",errors="replace")[:1500]
-        raise HTTPException(status_code=502,detail=f"Online zoekdienst gaf een fout ({exc.code}): {detail}")
-    except Exception as exc:
-        raise HTTPException(status_code=502,detail=f"Online zoeken mislukt: {exc}")
+    cache_key=query.casefold()
+    cached=_MACHINE_SPEC_SEARCH_CACHE.get(cache_key)
+    if cached and time.time()-float(cached.get("at") or 0)<_MACHINE_SPEC_SEARCH_TTL_S:
+        return cached["result"]
 
     try:
-        parsed=_machine_spec_extract_json(_machine_spec_output_text(api_payload))
+        brand,model_key,sources,providers,fetch_errors=_machine_spec_fetch_sources(query)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=502,detail=f"Zoekresultaat kon niet betrouwbaar worden gelezen: {exc}")
+        raise HTTPException(status_code=502,detail=f"Online zoeken zonder API-sleutel is mislukt: {exc}")
 
-    allowed={_machine_spec_norm_url(u) for u in _machine_spec_collect_urls(api_payload)}
-    allowed.discard("")
-    raw_fields=parsed.get("fields") if isinstance(parsed.get("fields"),dict) else {}
-    limits={
-        "machineFeedMaxMMin":(1,500),
-        "machineFeedAccelMS2":(0.1,300),
-        "zAxisMaxStrokeMm":(1,2000),
-        "zAxisMaxSpeedMmS":(1,5000),
-        "zAxisAccelMS2":(0.1,500),
-    }
-    fields={
-        key:_machine_spec_clean_field(raw_fields.get(key),allowed,low=lo,high=hi)
-        for key,(lo,hi) in limits.items()
-    }
-    exact=bool(parsed.get("exact_model_match"))
-    warnings=[str(x)[:500] for x in (parsed.get("warnings") or []) if str(x).strip()][:8]
-    if not exact:
-        warnings.insert(0,"Het exacte machinemodel kon online niet met voldoende zekerheid worden bevestigd; neem geen waarden blind over.")
-        for f in fields.values():
-            f["value"]=None
+    fields={}
+    warnings=[]
+    for key in _MACHINE_SPEC_FIELD_RULES:
+        candidates=[]
+        for source in sources:
+            candidates.extend(_machine_spec_extract_candidates(source,key))
+        field,conflict=_machine_spec_resolve_candidates(key,candidates)
+        fields[key]=field
+        if conflict:
+            warnings.append(conflict)
+
     found=sum(1 for f in fields.values() if isinstance(f.get("value"),(int,float)))
     if found<5:
-        warnings.append(f"{5-found} van de 5 gevraagde machinewaarden zijn bewust leeg gelaten omdat er geen voldoende betrouwbare, exacte bron is gevonden.")
+        warnings.append(
+            f"{5-found} van de 5 gevraagde machinewaarden zijn leeg gelaten omdat ze niet expliciet of niet eenduidig in de gecontroleerde bronnen voor dit exacte model stonden."
+        )
+    if fetch_errors and len(sources)<3:
+        warnings.append("Niet alle gevonden bronpagina's konden door de server worden geopend; alleen daadwerkelijk gecontroleerde pagina's zijn gebruikt.")
 
-    return {
+    result={
         "query":query,
-        "machine_name":str(parsed.get("machine_name") or query)[:180],
-        "exact_model_match":exact,
+        "machine_name":query,
+        "exact_model_match":True,
         "fields":fields,
-        "warnings":warnings,
-        "provider":"OpenAI web search",
-        "model":model,
+        "warnings":warnings[:8],
+        "provider":"Openbare webzoekopdracht (geen API-sleutel)",
+        "search_engines":providers,
+        "sources_checked":len(sources),
+        "sources":[
+            {"url":s["url"],"title":s["title"],"score":round(float(s.get("score") or 0),2)}
+            for s in sources[:8]
+        ],
     }
+    _MACHINE_SPEC_SEARCH_CACHE[cache_key]={"at":time.time(),"result":result}
+    return result
 
 @app.post("/api/cut-layer/build-machine")
 # v695 — simplified koker layer writer: exact editable Cut/Corner set with round-trip validation.
