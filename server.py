@@ -4923,7 +4923,8 @@ def list_quotes():
                     quote["approval"] = approval
 
         # Eén eenduidige actuele status voor de lijst. Prioriteit volgt de echte
-        # offerte-lifecycle: gefactureerd > geaccepteerd > bekeken > verstuurd > opgeslagen.
+        # offerte-lifecycle: gefactureerd > geaccepteerd > verstuurd > opgeslagen.
+        # Bekijken blijft detailinformatie bij de e-mail/acceptatielink.
         for row in rows:
             lifecycle = row.pop("_list_lifecycle", {}) or {}
             approval = row.get("approval") or {}
@@ -4947,11 +4948,6 @@ def list_quotes():
                 row["quote_status_label"] = "Geaccepteerd"
                 row["quote_status_detail"] = str(approval.get("accepted_by") or "Klant")
                 row["quote_status_at"] = str(approval.get("accepted_at") or "")
-            elif approval.get("viewed_at"):
-                row["quote_status"] = "viewed"
-                row["quote_status_label"] = "Bekeken"
-                row["quote_status_detail"] = "Wacht op akkoord"
-                row["quote_status_at"] = str(approval.get("viewed_at") or "")
             elif last_mail_at:
                 row["quote_status"] = "mailed"
                 row["quote_status_label"] = "Verstuurd"
@@ -7873,18 +7869,23 @@ def _profile_source_dimensions(filename: str, path: str = "") -> dict:
     if not filename.lower().endswith('.sldlfp'):
         raise ValueError('Geen SLDLFP-profielbestand.')
     stem = filename[:-7].strip()
-    shape_patterns = {
-        'Vierkant': r'vierkante?(?:\s+kokers?)?|square',
-        'Rechthoek': r'rechthoek(?:ige?)?(?:\s+kokers?)?|reachthoekig(?:\s+kokers?)?|rectangular',
-        'Rond': r'ronde?(?:\s+buizen|\s+buis)?|round(?:\s+tube)?',
-        'Strip': r'strip(?:pen)?(?:\s+\d+(?:[.,]\d+)?\s*mm)?|plat(?:te)?\s*staal|flat(?:\s+bar)?',
-    }
+    # Explicit shape words can occur anywhere in a folder name, e.g.
+    # "RVS - ronde buizen". Generic "buizen" is only a fallback below.
     def shape_hint(text):
-        return {shape for shape,pattern in shape_patterns.items()
-                if re.fullmatch(pattern, text.strip(), re.IGNORECASE)}
+        text = re.sub(r'[_\-]+', ' ', text.casefold())
+        patterns = {
+            'Vierkant': r'\b(?:vierkant|vierkante|square)\b',
+            'Rechthoek': r'\b(?:rechthoek|rechthoeken|rechthoekig|rechthoekige|reachthoekig|rectangular|rectangle)\b',
+            'Rond': r'\b(?:rond|ronde|round|circular)\b',
+            'Strip': r'\b(?:strip|strippen|platstaal|flat\s+bar|platte?\s+staal)\b',
+        }
+        return {shape for shape, pattern in patterns.items() if re.search(pattern, text)}
 
-    # Consume only known prefixes; arbitrary text such as "copy" remains a warning.
-    prefix = re.match(r'^(ronde?\s+buis|ronde?\s+buizen|ronde?|round(?:\s+tube)?|strip(?:pen)?|plat(?:te)?\s*staal|flat(?:\s+bar)?|vierkante?(?:\s+koker)?|square|rechthoek(?:ige?)?(?:\s+koker)?|rectangular|koker)\s+', stem, re.IGNORECASE)
+    def generic_tube(text):
+        return bool(re.search(r'\b(?:buis|buizen|tube|tubes|pipe|pipes)\b',
+                              text.replace('_', ' '), re.IGNORECASE))
+
+    prefix = re.match(r'^(ronde?\s+(?:buis|buizen)|ronde?|round(?:\s+tubes?)?|buis|buizen|tubes?|pipes?|strip(?:pen)?|plat(?:te)?\s*staal|flat(?:\s+bar)?|vierkante?(?:\s+(?:kokers?|buizen|buis))?|square(?:\s+tubes?)?|rechthoek(?:ige?)?(?:\s+(?:kokers?|buizen|buis))?|rectangular(?:\s+tubes?)?|kokers?)\s+', stem, re.IGNORECASE)
     name_hints = shape_hint(prefix.group(1)) if prefix else set()
     dimensions = stem[prefix.end():].strip() if prefix else stem
     if dimensions.startswith(('Ø','ø','⌀')):
@@ -7895,13 +7896,19 @@ def _profile_source_dimensions(filename: str, path: str = "") -> dict:
     a,b,c,r = [float(v.replace(',', '.')) if v is not None else None for v in match.groups()]
     if any(not math.isfinite(v) or v <= 0 or v > 100000 for v in (a,b,c,r) if v is not None):
         raise ValueError('Ongeldige profielmaat.')
+    folders = PurePosixPath(path.replace('\\','/')).parts[:-1]
     folder_hints = set()
-    for folder in PurePosixPath(path.replace('\\','/')).parts[:-1]:
+    for folder in folders:
         folder_hints.update(shape_hint(folder))
     hints = folder_hints | name_hints
     if len(hints)>1:
         raise ValueError('Profielvorm in bestandsnaam en/of mappen spreekt elkaar tegen; controleer het bestand.')
     hint = next(iter(hints), None)
+    if not hint and c is None and (
+            any(generic_tube(folder) for folder in folders)
+            or (prefix and generic_tube(prefix.group(1)))):
+        hint = 'Rond'
+
     if hint == 'Strip':
         if c is not None or r is not None:
             raise ValueError('Een strip verwacht breedte x dikte, zonder derde maat of radius.')
