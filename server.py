@@ -45,6 +45,7 @@ TTL_HOURS = int(os.environ.get("STEP_TTL_HOURS", "6"))
 
 STEP_MATERIAL_LENGTH_VERSION = 8  # full body projection along longitudinal profile axis
 STEP_PROFILE_RECOGNITION_VERSION = 12  # v771: topology-based outer skin + tabs/end contours
+# v966: LCM writer ondersteunt Corner Speed (%) naast Define corner/B-as parameters.
 
 app = FastAPI(title="Vakstaal STEP Server", version="1.0.0")
 
@@ -4021,7 +4022,7 @@ def _lcm_strict_desired(desired: dict) -> dict:
         "peakPowerEnabled","peakPowerPct",
         "dutyCycleEnabled","dutyCyclePct",
         "frequencyEnabled","frequencyHz",
-        "defineCornerDegPerMm","limitBAxisSpeed",
+        "cornerSpeed","defineCornerDegPerMm","limitBAxisSpeed",
         "bAxisSpeedRpm","bAxisAccelerationRadS2","bAxisAcceleration"
     }
     unknown_corner=sorted(set(corner)-allowed_corner)
@@ -4234,6 +4235,15 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
         payload,ok=_lcm_replace_named_scalar_code(payload,b"PTFreq",code)
         require(ok,"Corner Frequency")
 
+    # v966: Corner Speed is in TubePro een percentage van de normale Cut Speed.
+    # 40 betekent dus 40% van de rechte snijsnelheid door de radius/hoek.
+    if corner.get("cornerSpeed") is not None:
+        corner_speed=float(corner["cornerSpeed"])
+        if not 0 < corner_speed <= 100:
+            raise ValueError("Corner Speed moet groter dan 0 en maximaal 100% zijn.")
+        payload,ok=_lcm_replace_named_number(payload,b"PTCornerSpeed",corner_speed)
+        require(ok,"Corner Speed")
+
     if corner.get("defineCornerDegPerMm") is not None:
         rad=float(corner["defineCornerDegPerMm"])*math.pi/180.0
         payload,ok=_lcm_replace_named_number(payload,b"PTCornerStandard",rad)
@@ -4330,6 +4340,14 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
         pc.get("frequencyHz"),corner["frequencyHz"],1.0
     ):
         raise ValueError("Validatie mislukt voor Corner Frequency.")
+    if corner.get("cornerSpeed") is not None and not close_num(
+        pc.get("cornerSpeed"),corner["cornerSpeed"],0.05
+    ):
+        raise ValueError("Validatie mislukt voor Corner Speed.")
+    if corner.get("defineCornerDegPerMm") is not None and not close_num(
+        pc.get("defineCornerDegPerMm"),corner["defineCornerDegPerMm"],0.002
+    ):
+        raise ValueError("Validatie mislukt voor Define corner.")
     if corner.get("bAxisSpeedRpm") is not None and not close_num(
         pc.get("bAxisSpeedRpm"),corner["bAxisSpeedRpm"],0.02
     ):
