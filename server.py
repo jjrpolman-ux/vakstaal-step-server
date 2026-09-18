@@ -49,6 +49,7 @@ STEP_PROFILE_RECOGNITION_VERSION = 12  # v771: topology-based outer skin + tabs/
 
 app = FastAPI(title="Vakstaal STEP Server", version="1.0.0")
 
+# v1120: quote overwrite now reconciles current STEP/Nest/LCM manifests and removes obsolete files.
 # Authentication and outermost CORS are installed after route declarations.
 
 
@@ -2287,6 +2288,7 @@ _PRODUCTION_STEP_FILENAME_RE = re.compile(
     re.IGNORECASE,
 )
 _FILTERED_STEP_FILENAME_RE = re.compile(r"_OFFERTSELECTIE\.(?:step|stp)$", re.IGNORECASE)
+_GENERATED_CUT_LAYER_FILENAME_RE = re.compile(r"__Snijlayer_[^/\\]+\.lcm$", re.IGNORECASE)
 
 
 def _payload_filename_set(data: dict, key: str) -> set[str]:
@@ -2304,14 +2306,38 @@ def _payload_filename_set(data: dict, key: str) -> set[str]:
     return result
 
 
-def _quote_file_manifest(data: dict) -> tuple[set[str], set[str], set[str]]:
+def _quote_file_manifest(data: dict) -> dict[str, set[str]]:
+    """Authoritative manifest for technical quote files.
+
+    New frontends send every technical category explicitly. Empty lists are
+    meaningful: they mean that category should be empty after this save.
+    """
     production = _payload_filename_set(data, "production_step_files")
     filtered = _payload_filename_set(data, "filtered_step_files")
     sources = _payload_filename_set(data, "source_step_files")
-    step_filename = str(data.get("step_filename") or "").strip()
-    if step_filename:
-        sources.add(_safe_dropbox_name(step_filename, "bestand").lower())
-    return production, filtered, sources
+    nests = _payload_filename_set(data, "source_nest_files")
+    cut_layers = _payload_filename_set(data, "cut_layer_files")
+
+    # Nieuwe clients sturen expliciete manifests. Een lege lijst betekent:
+    # deze offerte gebruikt geen bronbestand van dit type meer. Alleen oudere
+    # clients zonder manifest mogen nog terugvallen op step_filename/nest_filename.
+    if not isinstance(data.get("source_step_files"), list):
+        step_filename = str(data.get("step_filename") or "").strip()
+        if step_filename:
+            sources.add(_safe_dropbox_name(step_filename, "bestand").lower())
+
+    if not isinstance(data.get("source_nest_files"), list):
+        nest_filename = str(data.get("nest_filename") or "").strip()
+        if nest_filename:
+            nests.add(_safe_dropbox_name(nest_filename, "bestand").lower())
+
+    return {
+        "production": production,
+        "filtered": filtered,
+        "sources": sources,
+        "nests": nests,
+        "cut_layers": cut_layers,
+    }
 
 
 def _same_dropbox_path(a: str, b: str) -> bool:
@@ -2357,19 +2383,39 @@ def _dedupe_quote_file_rows(conn, quote_id: str) -> int:
     return removed
 
 
-def _reconcile_quote_generated_steps(conn, quote_id: str, data: dict) -> list[str]:
-    """Remove obsolete generated STEP versions after quantity/geometry changes.
+def _reconcile_quote_managed_files(conn, quote_id: str, data: dict) -> list[str]:
+    """Delete obsolete technical files after overwriting a quote.
 
-    Production STEP filenames include the quantity (e.g. 100x_..., 120x_...).
-    Before this reconciliation every changed quantity created a new filename, so
-    old files remained visible in both the offer list and Dropbox.
+    This is deliberately manifest-driven. Quantity changes, removed products,
+    replaced STEP imports and changed cut-layers may all create a new filename.
+    Anything no longer present in the CURRENT manifest is removed from Dropbox
+    and quote_files.
+
+    PDFs and unrelated user attachments are not touched here.
     """
+    manifest = _quote_file_manifest(data)
+
     reconcile_production = isinstance(data.get("production_step_files"), list)
     reconcile_filtered = isinstance(data.get("filtered_step_files"), list)
-    if not reconcile_production and not reconcile_filtered:
+    reconcile_sources = isinstance(data.get("source_step_files"), list)
+    reconcile_nests = isinstance(data.get("source_nest_files"), list)
+    reconcile_cut_layers = isinstance(data.get("cut_layer_files"), list)
+
+    if not any((
+        reconcile_production,
+        reconcile_filtered,
+        reconcile_sources,
+        reconcile_nests,
+        reconcile_cut_layers,
+    )):
         return []
 
-    production, filtered, source_names = _quote_file_manifest(data)
+    production = manifest["production"]
+    filtered = manifest["filtered"]
+    source_names = manifest["sources"]
+    nest_names = manifest["nests"]
+    cut_layers = manifest["cut_layers"]
+
     removed_names: list[str] = []
     cur = conn.cursor()
     cur.execute(
@@ -2389,22 +2435,38 @@ def _reconcile_quote_generated_steps(conn, quote_id: str, data: dict) -> list[st
 
         safe_name = _safe_dropbox_name(str(filename or ""), "bestand")
         key = safe_name.lower()
-        if key in source_names:
-            continue
+        suffix = Path(safe_name).suffix.lower()
 
         obsolete = False
+
         if reconcile_production and _PRODUCTION_STEP_FILENAME_RE.match(safe_name):
             obsolete = key not in production
+
         elif reconcile_filtered and _FILTERED_STEP_FILENAME_RE.search(safe_name):
             obsolete = key not in filtered
+
+        elif reconcile_cut_layers and _GENERATED_CUT_LAYER_FILENAME_RE.search(safe_name):
+            obsolete = key not in cut_layers
+
+        elif (
+            reconcile_sources
+            and suffix in {".step", ".stp"}
+            and not _PRODUCTION_STEP_FILENAME_RE.match(safe_name)
+            and not _FILTERED_STEP_FILENAME_RE.search(safe_name)
+        ):
+            obsolete = key not in source_names
+
+        elif reconcile_nests and suffix in {".zx", ".nest"}:
+            obsolete = key not in nest_names
 
         if not obsolete:
             continue
 
-        # Eerst fysiek opruimen. Als Dropbox faalt blijft de DB-rij bestaan zodat
-        # een volgende save de cleanup opnieuw kan proberen en niets stil orphaned raakt.
+        # Delete Dropbox first. If that fails, keep DB metadata so the next save
+        # can retry instead of silently leaving an orphan.
         if dropbox_path:
             _dropbox_delete_path(str(dropbox_path))
+
         cur.execute(
             _sql("DELETE FROM quote_files WHERE id=%s", "DELETE FROM quote_files WHERE id=?"),
             (file_id,),
@@ -2412,6 +2474,11 @@ def _reconcile_quote_generated_steps(conn, quote_id: str, data: dict) -> list[st
         removed_names.append(safe_name)
 
     return removed_names
+
+
+# Compatibility alias for older call sites / diagnostics.
+def _reconcile_quote_generated_steps(conn, quote_id: str, data: dict) -> list[str]:
+    return _reconcile_quote_managed_files(conn, quote_id, data)
 
 
 async def _store_quote_files(
@@ -5796,8 +5863,8 @@ async def create_quote(request: Request):
                 )
             )
 
-            production_names, filtered_names, _source_names = _quote_file_manifest(data)
-            managed_step_names = production_names | filtered_names
+            file_manifest = _quote_file_manifest(data)
+            managed_step_names = file_manifest['production'] | file_manifest['filtered']
             stored_files=await _store_quote_files(
                 conn,
                 quote_id,
@@ -5805,7 +5872,7 @@ async def create_quote(request: Request):
                 managed_step_names=managed_step_names,
             )
             deduplicated_files=_dedupe_quote_file_rows(conn, quote_id)
-            removed_generated_files=_reconcile_quote_generated_steps(conn, quote_id, data)
+            removed_obsolete_files=_reconcile_quote_managed_files(conn, quote_id, data)
 
             dropbox_warning=""
             try:
@@ -5824,7 +5891,8 @@ async def create_quote(request: Request):
             result["stored_upload_count"]=len(stored_files)
             result["stored_uploads"]=stored_files
             result["deduplicated_file_rows"]=deduplicated_files
-            result["removed_obsolete_generated_files"]=removed_generated_files
+            result["removed_obsolete_files"]=removed_obsolete_files
+            result["removed_obsolete_generated_files"]=removed_obsolete_files
             return result
     finally:
         try:
@@ -5937,8 +6005,8 @@ async def update_quote(quote_id: str, request: Request):
                 )
             )
 
-            production_names, filtered_names, _source_names = _quote_file_manifest(data)
-            managed_step_names = production_names | filtered_names
+            file_manifest = _quote_file_manifest(data)
+            managed_step_names = file_manifest['production'] | file_manifest['filtered']
             stored_files=await _store_quote_files(
                 conn,
                 quote_id,
@@ -5946,7 +6014,7 @@ async def update_quote(quote_id: str, request: Request):
                 managed_step_names=managed_step_names,
             )
             deduplicated_files=_dedupe_quote_file_rows(conn, quote_id)
-            removed_generated_files=_reconcile_quote_generated_steps(conn, quote_id, data)
+            removed_obsolete_files=_reconcile_quote_managed_files(conn, quote_id, data)
 
             dropbox_warning=""
             try:
@@ -5965,7 +6033,8 @@ async def update_quote(quote_id: str, request: Request):
             result["stored_upload_count"]=len(stored_files)
             result["stored_uploads"]=stored_files
             result["deduplicated_file_rows"]=deduplicated_files
-            result["removed_obsolete_generated_files"]=removed_generated_files
+            result["removed_obsolete_files"]=removed_obsolete_files
+            result["removed_obsolete_generated_files"]=removed_obsolete_files
             return result
     finally:
         try:
