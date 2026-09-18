@@ -5058,6 +5058,16 @@ async def generate_production_step(request: Request):
     - ronde holle buizen
     - ronde, vierkante (met hoekradius), ovale en sleufvormige uitsparingen
     - per bewerking door één wand of beide tegenoverliggende wanden
+    - overlappende bewerkingen worden CAD-technisch eerst samengevoegd tot één
+      gezamenlijke snijvolume, zodat de uiteindelijke STEP één open contour
+      krijgt waar vormen elkaar overlappen.
+
+    v934 merged contour:
+    De oorspronkelijke parametrische vormen blijven exact (cirkels blijven
+    cirkels, sleuven blijven echte sleuven). De server rasteriseert de contour
+    dus niet: hij verenigt de echte CadQuery cutters vóórdat materiaal uit de
+    koker wordt gesneden. Dit geeft dezelfde samengestelde opening als de
+    frontend, maar zonder verlies van geometrische nauwkeurigheid.
 
     v774 performance:
     Het STEP-bestand bevat bewust slechts ÉÉN representatieve productie-body
@@ -5272,13 +5282,22 @@ async def generate_production_step(request: Request):
             raise ValueError(f"Onbekende profielbewerking: {op_type}")
 
         def apply_profile_operations(tube, length: float, operations: list):
-            # Profielas = Z. Lokale X van de bewerking = productlengterichting.
+            """
+            Bouw eerst alle exacte CAD-cutters en verenig die daarna vóór de cut.
+
+            Daardoor worden overlappende gaten/sleuven/vierkante uitsparingen
+            geometrisch één opening. De resulterende STEP bevat dus niet langer
+            een interne contourlijn waar twee bewerkingen elkaar overlappen.
+
+            Belangrijk: dit is een echte CAD-union van de parametrische vormen,
+            geen polygon/raster-benadering uit de browser.
+            """
             if not operations:
                 return tube
 
             cross_w = diameter if is_round else outer_w
             cross_h = diameter if is_round else outer_h
-            result = tube
+            cutters = []
 
             for op in operations:
                 op_type = str(op.get("type") or "hole").lower()
@@ -5337,9 +5356,31 @@ async def generate_production_step(request: Request):
                     plane,
                     travel,
                 )
-                result = result.cut(cutter)
+                cutters.append(cutter)
 
-            return result
+            if not cutters:
+                return tube
+
+            # Exacte CAD-union. Bij overlappende vormen verdwijnt hierdoor de
+            # interne overlaprand; losse vormen blijven als losse solids binnen
+            # dezelfde compound/union bestaan en worden nog steeds correct
+            # uitgesneden.
+            try:
+                merged_cutter = cutters[0]
+                for cutter in cutters[1:]:
+                    merged_cutter = merged_cutter.union(cutter)
+                try:
+                    merged_cutter = merged_cutter.clean()
+                except Exception:
+                    pass
+                return tube.cut(merged_cutter)
+            except Exception:
+                # Robuuste fallback voor exotische OCC-booleans: behoud dezelfde
+                # eindgeometrie door de originele cutters één voor één te snijden.
+                result = tube
+                for cutter in cutters:
+                    result = result.cut(cutter)
+                return result
 
         # v774: bouw maar één representatieve body.
         piece = normalized_pieces[0]
@@ -5389,6 +5430,8 @@ async def generate_production_step(request: Request):
                 "Content-Disposition": 'attachment; filename="productie.step"',
                 "X-Vakstaal-Quantity": str(quantity),
                 "X-Vakstaal-Bodies": "1",
+                "X-Vakstaal-Operation-Union": "exact-cad-v1",
+                "X-Vakstaal-Production-Step": "merged-overlap-contours",
             }
         )
     except HTTPException:
