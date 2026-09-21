@@ -5389,7 +5389,7 @@ async def generate_production_step(request: Request):
 
                 extra = 2.0
                 if face in {"top", "bottom"}:
-                    travel = cross_h + extra * 2.0 if through == "both" else wall + extra * 2.0
+                    travel = cross_h + extra * 2.0 if through == "both" else (cross_h / 2.0 + extra if is_round else wall + extra * 2.0)
                     if face == "top":
                         origin = (offset, cross_h / 2.0 + extra, pos)
                         normal = (0, -1, 0)
@@ -5402,7 +5402,7 @@ async def generate_production_step(request: Request):
                         normal=cq.Vector(*normal),
                     )
                 else:
-                    travel = cross_w + extra * 2.0 if through == "both" else wall + extra * 2.0
+                    travel = cross_w + extra * 2.0 if through == "both" else (cross_w / 2.0 + extra if is_round else wall + extra * 2.0)
                     if face == "right":
                         origin = (cross_w / 2.0 + extra, offset, pos)
                         normal = (-1, 0, 0)
