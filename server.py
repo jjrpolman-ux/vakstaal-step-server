@@ -44,7 +44,7 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 TTL_HOURS = int(os.environ.get("STEP_TTL_HOURS", "6"))
 
 STEP_MATERIAL_LENGTH_VERSION = 8  # full body projection along longitudinal profile axis
-STEP_PROFILE_RECOGNITION_VERSION = 12  # v771: topology-based outer skin + tabs/end contours
+STEP_PROFILE_RECOGNITION_VERSION = 13  # v771: topology-based outer skin + tabs/end contours
 # v966: LCM writer ondersteunt Corner Speed (%) naast Define corner/B-as parameters.
 
 app = FastAPI(title="Vakstaal STEP Server", version="1.0.0")
@@ -491,7 +491,7 @@ def _analysis_cache_path(job_id: str) -> Path:
 
 
 def _assembly_cache_path(job_id: str) -> Path:
-    return CACHE_DIR / job_id / "assembly_mesh_physical_cut_v66_authoritative_length_v7.json"
+    return CACHE_DIR / job_id / "assembly_mesh_physical_cut_v67_profile_frame.json"
 
 
 def _load_or_analyze(job_id: str, step_path: Path) -> dict:
@@ -1003,6 +1003,7 @@ def _profile_basis_for_features(
         solid, zdir, max(ow, 1.0), max(oh, 1.0)
     )
     xdir = np.array(xdir, dtype=float)
+    xdir -= np.dot(xdir, zdir) * zdir
     xdir /= max(float(np.linalg.norm(xdir)), 1e-12)
     ydir = np.cross(zdir, xdir)
     ydir /= max(float(np.linalg.norm(ydir)), 1e-12)
@@ -1530,6 +1531,19 @@ def _base_cut_polylines(
 )->list[list[list[float]]]:
     base,_features,_count=_physical_cut_polylines(solid,detail)
     return base
+
+
+def _simulation_profile_frame(solid: cq.Shape, detail: dict | None) -> dict:
+    # Use the same stock-aligned coordinate system for CAD contours and simulation.
+    if not detail or not detail.get("recognized"):
+        return {}
+    try:
+        basis = _profile_basis_for_features(solid, detail)
+        return {"profile_axis": [float(v) for v in basis[3]],
+                "profile_basis_u": [float(v) for v in basis[1]],
+                "profile_basis_v": [float(v) for v in basis[2]]}
+    except Exception:
+        return {}
 
 
 def _mesh_shape(shape: cq.Shape, *, center_vertices: bool = False) -> dict:
@@ -8397,7 +8411,8 @@ def assembly_mesh(job_id: str):
                 "feature_lines": feature_lines,
                 "feature_classifier_version": 8,
                 "physical_cut_classifier_version": 3,
-                "profile_axis": [float(axis[0]), float(axis[1]), float(axis[2])],
+                "profile_axis": [float(v) for v in axis],
+                **_simulation_profile_frame(solid, detail),
                 "has_extra_features": bool(feature_lines),
                 "trimmed_visual": bool(was_trimmed),
                 "feature_preserving_trim": False,
@@ -8510,7 +8525,8 @@ def solid_mesh(job_id: str, solid_index: int):
             "feature_lines": feature_lines,
             "feature_classifier_version": 8,
             "physical_cut_classifier_version": 3,
-            "profile_axis": [float(axis[0]), float(axis[1]), float(axis[2])],
+            "profile_axis": [float(v) for v in axis],
+            **_simulation_profile_frame(solid, detail),
             "has_extra_features": bool(feature_lines),
             "size": mesh["size"],
             "net_geometry": True,
