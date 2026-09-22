@@ -3393,11 +3393,9 @@ def _lcm_cut_parameters_complete(data: bytes,cut_block: dict) -> dict:
             if cut_block.get("CycleTime") is not None
             else _lcm_decode_cut_field_by_id(data,0x23)
         ),
-        "pierceTimeMs":(
-            cut_block.get("CycleTime")
-            if cut_block.get("CycleTime") is not None
-            else _lcm_decode_cut_field_by_id(data,0x23)
-        ),  # legacy compatibiliteit
+        # Het zichtbare veld "Pierce time" op het Cut-tabblad is TimeStay.
+        # CycleTime is een apart machine-/cyclusveld en mag hier niet voor worden gebruikt.
+        "pierceTimeMs":cut_block.get("TimeStay"),
         "timeFocusMs":(
             cut_block.get("TimeFocus")
             if cut_block.get("TimeFocus") is not None
@@ -3447,7 +3445,9 @@ def _lcm_pierce_parameters_complete(data: bytes) -> dict:
             "beamSize":block.get("BeamSize"),
             "focusMm":block.get("Focus"),
             "endFocusMm":block.get("FocusEnd"),
-            "pierceTimeMs":block.get("FreqEnd"),
+            # Het onderste zichtbare "Pierce time"-veld per Pierce-stage is TimeStay.
+            # FreqEnd is frequentie (Hz) en mag nooit als milliseconden worden geïnterpreteerd.
+            "pierceTimeMs":block.get("TimeStay"),
             "laserOffGasOnMs":block.get("CycleTime"),
         }
     return {"type":ptype,**stages}
@@ -3898,6 +3898,46 @@ def _lcm_reference_code_for_number(data: bytes, value: float, tol: float=1e-9) -
     return None
 
 
+def _lcm_replace_laser_block_number_by_name(
+    data: bytes, block_name: bytes, next_name: bytes|None, field_name: str, value: float
+) -> tuple[bytes,bool]:
+    """
+    Schrijf een numeriek veld uitsluitend binnen één laserblok (Cut/Pierce1/2/3).
+
+    Zowel inline ASCII-getallen als value-table references worden lokaal naar een
+    inline numerieke waarde omgezet. Daardoor wijzigen gedeelde tabelwaarden en
+    andere stages nooit mee.
+    """
+    field_index=_lcm_laser_field_index(data,field_name)
+    if field_index is None:
+        return data,False
+
+    marker_block=b"\x00\x00\x00"+bytes([len(block_name)])+block_name
+    start=data.find(marker_block)
+    if start<0:
+        start=data.find(block_name)
+    if start<0:
+        return data,False
+    end=data.find(next_name,start+len(block_name)) if next_name else -1
+    if end<0:
+        end=min(len(data),start+900)
+
+    marker=bytes([0x00,0x01,field_index])
+    pos=data.find(marker,start,end)
+    if pos<0 or pos+3>=end:
+        return data,False
+
+    raw=_lcm_number_text(float(value))
+    if pos+6<=end and data[pos+3:pos+5]==b"\x00\x00":
+        ln=data[pos+5]
+        v0=pos+6
+        if 0 < ln <= 64 and v0+ln<=end:
+            return data[:pos+5]+bytes([len(raw)])+raw+data[v0+ln:],True
+
+    replacement=marker+b"\x00\x00"+bytes([len(raw)])+raw
+    return data[:pos]+replacement+data[pos+4:],True
+
+
 def _lcm_replace_cut_number_by_name(data: bytes, field_name: str, value: float) -> tuple[bytes,bool]:
     """
     Write a numeric Cut field by its real FSMATERIAL field name.
@@ -4085,17 +4125,39 @@ def _lcm_strict_desired(desired: dict) -> dict:
     desired=dict(desired or {})
     allowed_top={
         "radiusMm","cutSpeedMMin","cutGasMachine","focusMm",
-        "cutParameters","cornerParameters","note"
+        "cutParameters","pierceParameters","cornerParameters","note"
     }
     unknown_top=sorted(set(desired)-allowed_top)
     if unknown_top:
         raise ValueError("Niet-toegestane LCM-velden: "+", ".join(unknown_top))
 
     cut=dict(desired.get("cutParameters") or {})
-    allowed_cut={"cutHeightMm","peakPowerPct","dutyCyclePct","frequencyHz"}
+    allowed_cut={"cutHeightMm","peakPowerPct","dutyCyclePct","frequencyHz","pierceTimeMs"}
     unknown_cut=sorted(set(cut)-allowed_cut)
     if unknown_cut:
         raise ValueError("Niet-toegestane Cut-velden: "+", ".join(unknown_cut))
+
+    pierce=dict(desired.get("pierceParameters") or {})
+    allowed_pierce={"type","stage1","stage2","stage3"}
+    unknown_pierce=sorted(set(pierce)-allowed_pierce)
+    if unknown_pierce:
+        raise ValueError("Niet-toegestane Pierce-velden: "+", ".join(unknown_pierce))
+    clean_pierce={}
+    if "type" in pierce:
+        try:
+            ptype=int(round(float(pierce.get("type"))))
+        except Exception:
+            raise ValueError("Pierce Type moet 0, 1, 2 of 3 zijn.")
+        if ptype not in (0,1,2,3):
+            raise ValueError("Pierce Type moet 0, 1, 2 of 3 zijn.")
+        clean_pierce["type"]=ptype
+    for stage_name in ("stage1","stage2","stage3"):
+        stage=dict(pierce.get(stage_name) or {})
+        unknown_stage=sorted(set(stage)-{"pierceTimeMs"})
+        if unknown_stage:
+            raise ValueError(f"Niet-toegestane {stage_name}-velden: "+", ".join(unknown_stage))
+        if "pierceTimeMs" in stage:
+            clean_pierce[stage_name]={"pierceTimeMs":stage.get("pierceTimeMs")}
 
     corner=dict(desired.get("cornerParameters") or {})
     allowed_corner={
@@ -4123,6 +4185,7 @@ def _lcm_strict_desired(desired: dict) -> dict:
 
     clean={k:desired.get(k) for k in allowed_top if k in desired}
     clean["cutParameters"]={k:cut.get(k) for k in allowed_cut if k in cut}
+    clean["pierceParameters"]=clean_pierce
     clean["cornerParameters"]={k:corner.get(k) for k in allowed_corner if k in corner}
     return clean
 
@@ -4148,7 +4211,10 @@ def _lcm_assert_preserved(reference_parsed: dict, parsed: dict, desired: dict) -
     if not same(reference_parsed.get("gasPressureBar"),parsed.get("gasPressureBar"),0.02):
         raise ValueError("Veiligheidscontrole: gasdruk veranderde onverwacht.")
 
-    for group in ("pierceParameters","otherParameters","advancedParameters"):
+    groups=["otherParameters","advancedParameters"]
+    if not (desired.get("pierceParameters") or {}):
+        groups.insert(0,"pierceParameters")
+    for group in groups:
         before=reference_parsed.get(group) or {}
         after=parsed.get(group) or {}
         if before!=after:
@@ -4255,6 +4321,43 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
                 f"Cut Frequency {cut['frequencyHz']} Hz bestaat niet in de value-table van deze referentielayer."
             )
         require(ok,"Cut Frequency")
+
+    # Het zichtbare Pierce time-veld op Cut is TimeStay. Dit staat los van CycleTime.
+    if cut.get("pierceTimeMs") is not None:
+        ms=float(cut["pierceTimeMs"])
+        if not 0<=ms<=60000:
+            raise ValueError("Cut Pierce time moet tussen 0 en 60000 ms liggen.")
+        payload,ok=_lcm_replace_laser_block_number_by_name(
+            payload,b"Cut",b"Pierce1","TimeStay",ms
+        )
+        require(ok,"Cut Pierce time")
+
+    # PIERCE — stagekeuze plus het onderste echte Pierce time-veld (TimeStay) per stage.
+    pierce=dict(desired.get("pierceParameters") or {})
+    if "type" in pierce:
+        ptype=int(pierce["type"])
+        code=_lcm_reference_code_for_number(payload,float(ptype))
+        if code is None:
+            raise ValueError(f"Pierce Type {ptype} bestaat niet in de value-table van deze referentielayer.")
+        payload,ok=_lcm_replace_named_scalar_code(payload,b"PierceStepCount",code)
+        require(ok,"Pierce Type")
+
+    stage_blocks={
+        "stage1":(b"Pierce1",b"Pierce2"),
+        "stage2":(b"Pierce2",b"Pierce3"),
+        "stage3":(b"Pierce3",b"PipeCorner"),
+    }
+    for stage_name,(block_name,next_name) in stage_blocks.items():
+        stage=dict(pierce.get(stage_name) or {})
+        if stage.get("pierceTimeMs") is None:
+            continue
+        ms=float(stage["pierceTimeMs"])
+        if not 0<=ms<=60000:
+            raise ValueError(f"{stage_name} Pierce time moet tussen 0 en 60000 ms liggen.")
+        payload,ok=_lcm_replace_laser_block_number_by_name(
+            payload,block_name,next_name,"TimeStay",ms
+        )
+        require(ok,f"{stage_name} Pierce time")
 
     # CORNER — alleen bewezen named/scalar velden.
     corner=dict(desired.get("cornerParameters") or {})
@@ -4392,6 +4495,20 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
         (parsed.get("cutParameters") or {}).get("frequencyHz"),cut["frequencyHz"],1.0
     ):
         raise ValueError("Validatie mislukt voor Cut Frequency.")
+    if cut.get("pierceTimeMs") is not None and not close_num(
+        (parsed.get("cutParameters") or {}).get("pierceTimeMs"),cut["pierceTimeMs"],0.01
+    ):
+        raise ValueError("Validatie mislukt voor Cut Pierce time.")
+
+    parsed_pierce=parsed.get("pierceParameters") or {}
+    if "type" in pierce and int(round(float(parsed_pierce.get("type") or 0)))!=int(pierce["type"]):
+        raise ValueError("Validatie mislukt voor Pierce Type.")
+    for stage_name in ("stage1","stage2","stage3"):
+        wanted=(pierce.get(stage_name) or {}).get("pierceTimeMs")
+        if wanted is not None and not close_num(
+            (parsed_pierce.get(stage_name) or {}).get("pierceTimeMs"),wanted,0.01
+        ):
+            raise ValueError(f"Validatie mislukt voor {stage_name} Pierce time.")
 
     pc=parsed.get("cornerParameters") or {}
 
@@ -7155,6 +7272,53 @@ async def dropbox_cut_layer_delete(request: Request):
         raise HTTPException(status_code=400,detail="Alleen .LCM-snijlayerbestanden kunnen via deze route worden verwijderd.")
     _dropbox_delete_path(path)
     return {"ok":True,"path":path}
+
+
+@app.post("/api/dropbox/cut-layers/overwrite")
+async def dropbox_cut_layer_overwrite(request: Request):
+    """Overschrijf exact één bestaand Dropbox-LCM en verifieer de round-trip bytes + parser."""
+    try:
+        body=await request.json()
+    except Exception:
+        body={}
+    path=_normalize_dropbox_browser_path(body.get("path") or "")
+    if not path or not path.lower().endswith(".lcm"):
+        raise HTTPException(status_code=400,detail="Geef het exacte bestaande Dropbox-pad van een .LCM-bestand op.")
+    raw_b64=str(body.get("contentBase64") or "")
+    try:
+        new_data=base64.b64decode(raw_b64,validate=True)
+    except Exception:
+        raise HTTPException(status_code=400,detail="De gewijzigde LCM-data is ongeldig.")
+    if not new_data.startswith(b"FSMATERIAL"):
+        raise HTTPException(status_code=400,detail="De gewijzigde data is geen geldig FSMATERIAL/LCM-bestand.")
+
+    # Eerst lokaal parseerbaar maken; pas daarna Dropbox wijzigen.
+    filename=path.rsplit("/",1)[-1] or "snijlayer.lcm"
+    try:
+        _parse_fs_material_lcm(new_data,filename=filename)
+    except Exception as exc:
+        raise HTTPException(status_code=400,detail=f"Gewijzigde LCM kon niet worden gevalideerd: {exc}")
+
+    try:
+        old_data=_dropbox_download_bytes(path)
+    except Exception as exc:
+        raise HTTPException(status_code=404,detail=f"Bestaande Dropbox-layer kon niet worden gelezen: {exc}")
+
+    try:
+        meta=_dropbox_upload_bytes(path,new_data)
+        verify=_dropbox_download_bytes(path)
+        if verify!=new_data:
+            raise ValueError("Dropbox round-trip bytes wijken af van het gewijzigde bestand.")
+        parsed=_parse_fs_material_lcm(verify,filename=filename)
+    except Exception as exc:
+        # Beste poging tot rollback zodat een mislukte verificatie het bestaande machinebestand niet beschadigt.
+        try:
+            _dropbox_upload_bytes(path,old_data)
+        except Exception:
+            pass
+        raise HTTPException(status_code=502,detail=f"Overschrijven/verifiëren mislukt; oude layer is waar mogelijk hersteld: {exc}")
+
+    return {"ok":True,"path":path,"file":meta,"parsed":parsed,"verified":True}
 
 
 @app.get("/api/dropbox/status")
