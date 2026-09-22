@@ -3386,16 +3386,19 @@ def _lcm_cut_parameters_complete(data: bytes,cut_block: dict) -> dict:
         "dutyCyclePct":(float(ratio)*100.0 if isinstance(ratio,(int,float)) and abs(float(ratio))<=1.5 else ratio),
         "frequencyHz":frequency,
         "beamSizeMm":cut_block.get("BeamSize"),
-        # Echte timing uit het Cut-blok. CycleTime is NIET hetzelfde als piercen;
-        # de machine-LCM bevat daarnaast eigen focus/blow/follow/stay tijden.
+        # In het Cut-blok is CycleTime het zichtbare veld "Pierce time" uit de machine-UI.
+        # Dit is bevestigd op de echte 177,8x4,5 O2-layer: CycleTime = 30 ms.
+        # TimeStay is hier een apart intern veld en mag niet als normale Cut-piercetijd worden getoond.
         "cycleTimeMs":(
             cut_block.get("CycleTime")
             if cut_block.get("CycleTime") is not None
             else _lcm_decode_cut_field_by_id(data,0x23)
         ),
-        # Het zichtbare veld "Pierce time" op het Cut-tabblad is TimeStay.
-        # CycleTime is een apart machine-/cyclusveld en mag hier niet voor worden gebruikt.
-        "pierceTimeMs":cut_block.get("TimeStay"),
+        "pierceTimeMs":(
+            cut_block.get("CycleTime")
+            if cut_block.get("CycleTime") is not None
+            else _lcm_decode_cut_field_by_id(data,0x23)
+        ),
         "timeFocusMs":(
             cut_block.get("TimeFocus")
             if cut_block.get("TimeFocus") is not None
@@ -3433,8 +3436,21 @@ def _lcm_pierce_parameters_complete(data: bytes) -> dict:
     for number,name,next_name in ((1,b"Pierce1",b"Pierce2"),(2,b"Pierce2",b"Pierce3"),(3,b"Pierce3",b"PipeCorner")):
         block=_lcm_decode_laser_block(data,name,next_name)
         ratio=block.get("PwmRatio")
+        pierce_mode_raw=block.get("PierceMode")
+        # Lees de werkelijke PierceMode uit het LCM-blok. In de aangeleverde
+        # FSMATERIAL-layers is 0 = Segment Pie. Onbekende codes blijven zichtbaar
+        # als numerieke mode zodat de editor nooit stilletjes een verkeerde naam toont.
+        try:
+            pierce_mode_code=int(round(float(pierce_mode_raw)))
+        except Exception:
+            pierce_mode_code=None
+        pierce_mode_name={0:"Segment Pie"}.get(
+            pierce_mode_code,
+            (f"Mode {pierce_mode_code}" if pierce_mode_code is not None else None)
+        )
         stages[f"stage{number}"]={
-            "mode":"Segment Pie",
+            "mode":pierce_mode_name,
+            "modeCode":pierce_mode_code,
             "timeMs":block.get("TimeFollow"),
             "heightMm":block.get("Height"),
             "gas":_lcm_gas_name(block.get("GasType")),
@@ -3938,6 +3954,42 @@ def _lcm_replace_laser_block_number_by_name(
     return data[:pos]+replacement+data[pos+4:],True
 
 
+def _lcm_replace_laser_block_reference_number_by_name(
+    data: bytes, block_name: bytes, next_name: bytes|None, field_name: str, numeric_value: float
+) -> tuple[bytes,bool]:
+    """Write an enum/reference-backed laser field inside exactly one Cut/Pierce block."""
+    field_index=_lcm_laser_field_index(data,field_name)
+    if field_index is None:
+        return data,False
+    ref_code=_lcm_reference_code_for_number(data,float(numeric_value))
+    if ref_code is None:
+        return data,False
+
+    marker_block=b"\x00\x00\x00"+bytes([len(block_name)])+block_name
+    start=data.find(marker_block)
+    if start<0:
+        start=data.find(block_name)
+    if start<0:
+        return data,False
+    end=data.find(next_name,start+len(block_name)) if next_name else -1
+    if end<0:
+        end=min(len(data),start+900)
+
+    marker=bytes([0x00,0x01,field_index])
+    pos=data.find(marker,start,end)
+    if pos<0 or pos+3>=end:
+        return data,False
+
+    # Replace either an inline numeric payload or a one-byte reference with
+    # a single local value-table reference. This never changes other stages.
+    if pos+6<=end and data[pos+3:pos+5]==b"\x00\x00":
+        ln=data[pos+5]
+        v0=pos+6
+        if 0 < ln <= 64 and v0+ln<=end:
+            return data[:pos]+marker+bytes([ref_code&0xFF])+data[v0+ln:],True
+    return data[:pos+3]+bytes([ref_code&0xFF])+data[pos+4:],True
+
+
 def _lcm_replace_cut_number_by_name(data: bytes, field_name: str, value: float) -> tuple[bytes,bool]:
     """
     Write a numeric Cut field by its real FSMATERIAL field name.
@@ -4120,11 +4172,11 @@ def _lcm_strict_desired(desired: dict) -> dict:
     Whitelist voor machine-LCM wijzigingen.
     Onbekende velden worden NIET stil genegeerd: de build stopt.
     Daardoor kan een frontendwijziging nooit ongemerkt extra LCM-velden herschrijven.
-    Gas pressure / corner pressure zijn expliciet geen schrijfbare layerparameters.
+    Cut gas pressure is bewezen schrijfbaar; corner pressure blijft alleen-lezen.
     """
     desired=dict(desired or {})
     allowed_top={
-        "radiusMm","cutSpeedMMin","cutGasMachine","focusMm",
+        "radiusMm","cutSpeedMMin","cutGasMachine","focusMm","gasPressureBar",
         "cutParameters","pierceParameters","cornerParameters","note"
     }
     unknown_top=sorted(set(desired)-allowed_top)
@@ -4151,13 +4203,18 @@ def _lcm_strict_desired(desired: dict) -> dict:
         if ptype not in (0,1,2,3):
             raise ValueError("Pierce Type moet 0, 1, 2 of 3 zijn.")
         clean_pierce["type"]=ptype
+    allowed_stage={
+        "mode","modeCode","timeMs","heightMm","gas","pressureBar",
+        "peakPowerPct","dutyCyclePct","frequencyHz","beamSize",
+        "focusMm","endFocusMm","pierceTimeMs","laserOffGasOnMs"
+    }
     for stage_name in ("stage1","stage2","stage3"):
         stage=dict(pierce.get(stage_name) or {})
-        unknown_stage=sorted(set(stage)-{"pierceTimeMs"})
+        unknown_stage=sorted(set(stage)-allowed_stage)
         if unknown_stage:
             raise ValueError(f"Niet-toegestane {stage_name}-velden: "+", ".join(unknown_stage))
-        if "pierceTimeMs" in stage:
-            clean_pierce[stage_name]={"pierceTimeMs":stage.get("pierceTimeMs")}
+        if stage:
+            clean_pierce[stage_name]={k:stage.get(k) for k in allowed_stage if k in stage}
 
     corner=dict(desired.get("cornerParameters") or {})
     allowed_corner={
@@ -4173,15 +4230,11 @@ def _lcm_strict_desired(desired: dict) -> dict:
         raise ValueError("Niet-toegestane Corner-velden: "+", ".join(unknown_corner))
 
     # Gasdruk mag nooit via een layerwriter worden aangepast.
-    forbidden_pressure={
-        "gasPressureBar","pressureBar","cornerPressureBar","cornerPressureEnabled"
-    }
-    if forbidden_pressure & set(desired):
-        raise ValueError("Gasdruk is geen softwarematige layerparameter.")
+    forbidden_pressure={"pressureBar","cornerPressureBar","cornerPressureEnabled"}
     if forbidden_pressure & set(cut):
-        raise ValueError("Gasdruk is geen softwarematige Cut-layerparameter.")
+        raise ValueError("Onbekende Cut-gasdrukvelden zijn niet schrijfbaar.")
     if forbidden_pressure & set(corner):
-        raise ValueError("Corner gasdruk is geen softwarematige layerparameter.")
+        raise ValueError("Corner gasdruk is nog niet bewezen schrijfbaar en blijft alleen-lezen.")
 
     clean={k:desired.get(k) for k in allowed_top if k in desired}
     clean["cutParameters"]={k:cut.get(k) for k in allowed_cut if k in cut}
@@ -4208,7 +4261,7 @@ def _lcm_assert_preserved(reference_parsed: dict, parsed: dict, desired: dict) -
 
     # Nozzle wordt fysiek niet softwarematig geschreven; hij wordt uit Note/naam afgeleid.
     # Gas pressure, pierce, other en advanced instellingen moeten inhoudelijk gelijk blijven.
-    if not same(reference_parsed.get("gasPressureBar"),parsed.get("gasPressureBar"),0.02):
+    if desired.get("gasPressureBar") is None and not same(reference_parsed.get("gasPressureBar"),parsed.get("gasPressureBar"),0.02):
         raise ValueError("Veiligheidscontrole: gasdruk veranderde onverwacht.")
 
     groups=["otherParameters","advancedParameters"]
@@ -4230,7 +4283,7 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
     """
     Maakt een echte machine-LCM door één echte referentielayer te klonen.
 
-    Alleen bewezen velden worden aangepast. Gas pressure wordt nooit gewijzigd.
+    Alleen bewezen velden worden aangepast. Cut GasPressure is schrijfbaar en wordt round-trip gevalideerd; corner pressure blijft onaangeroerd.
     Onbekende binaire instellingen blijven exact uit de referentielayer komen.
     """
     desired=_lcm_strict_desired(desired)
@@ -4271,6 +4324,16 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
         gas_number=_lcm_machine_gas_number(cut_gas)
         payload,ok=_lcm_replace_cut_reference_number_by_name(payload,"GasType",gas_number)
         require(ok,"Cut Gas")
+
+    gas_pressure=desired.get("gasPressureBar")
+    if gas_pressure is not None:
+        gas_pressure=float(gas_pressure)
+        if not 0 <= gas_pressure <= 40:
+            raise ValueError("Cut Gas pressure moet tussen 0 en 40 BAR liggen.")
+        # GasPressure is een named numeric field in het Cut-blok van de echte LCM.
+        # Alleen schrijven wanneer het veld veilig herkenbaar is; round-trip validatie volgt hieronder.
+        payload,ok=_lcm_replace_cut_number_by_name(payload,"GasPressure",gas_pressure)
+        require(ok,"Cut Gas pressure")
 
     cut=dict(desired.get("cutParameters") or {})
 
@@ -4322,13 +4385,14 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
             )
         require(ok,"Cut Frequency")
 
-    # Het zichtbare Pierce time-veld op Cut is TimeStay. Dit staat los van CycleTime.
+    # Op het Cut-tabblad is het zichtbare veld "Pierce time" het CycleTime-veld.
+    # Voorbeeld echte 177,8x4,5 O2-layer: 30 ms.
     if cut.get("pierceTimeMs") is not None:
         ms=float(cut["pierceTimeMs"])
         if not 0<=ms<=60000:
             raise ValueError("Cut Pierce time moet tussen 0 en 60000 ms liggen.")
         payload,ok=_lcm_replace_laser_block_number_by_name(
-            payload,b"Cut",b"Pierce1","TimeStay",ms
+            payload,b"Cut",b"Pierce1","CycleTime",ms
         )
         require(ok,"Cut Pierce time")
 
@@ -4349,15 +4413,66 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
     }
     for stage_name,(block_name,next_name) in stage_blocks.items():
         stage=dict(pierce.get(stage_name) or {})
-        if stage.get("pierceTimeMs") is None:
+        if not stage:
             continue
-        ms=float(stage["pierceTimeMs"])
-        if not 0<=ms<=60000:
-            raise ValueError(f"{stage_name} Pierce time moet tussen 0 en 60000 ms liggen.")
-        payload,ok=_lcm_replace_laser_block_number_by_name(
-            payload,block_name,next_name,"TimeStay",ms
+
+        # Pierce mode: current known UI label Segment Pie == code 0. Unknown
+        # modes may be supplied as modeCode or as 'Mode N'/numeric text.
+        mode_value=stage.get("modeCode")
+        if mode_value is None and stage.get("mode") not in (None,""):
+            raw_mode=str(stage.get("mode")).strip()
+            if raw_mode.lower()=="segment pie":
+                mode_value=0
+            else:
+                m=re.search(r"-?\d+",raw_mode)
+                if m:
+                    mode_value=int(m.group(0))
+                else:
+                    raise ValueError(f"{stage_name} Pierce mode '{raw_mode}' is niet herkenbaar. Gebruik Segment Pie of een numerieke modecode.")
+        if mode_value is not None:
+            payload,ok=_lcm_replace_laser_block_number_by_name(
+                payload,block_name,next_name,"PierceMode",float(mode_value)
+            )
+            require(ok,f"{stage_name} Pierce mode")
+
+        numeric_fields=(
+            ("timeMs","TimeFollow","Stage tijd / follow",0,60000,1.0),
+            ("heightMm","Height","Piercing Height",0,100,1.0),
+            ("pressureBar","GasPressure","Gas pressure",0,40,1.0),
+            ("peakPowerPct","LaserCurrent","Peak power",0,100,1.0),
+            ("frequencyHz","PwmFreq","Frequency",0,200000,1.0),
+            ("beamSize","BeamSize","Beam Size",-100000,100000,1.0),
+            ("focusMm","Focus","Focus Pos.",-100,100,1.0),
+            ("endFocusMm","FocusEnd","End Focus",-100,100,1.0),
+            ("pierceTimeMs","TimeStay","Pierce time",0,60000,1.0),
+            ("laserOffGasOnMs","CycleTime","LaserOff and GasOn",0,60000,1.0),
         )
-        require(ok,f"{stage_name} Pierce time")
+        for key,field,label,lo,hi,scale in numeric_fields:
+            if stage.get(key) is None or str(stage.get(key)).strip()=="":
+                continue
+            value=float(stage[key])*scale
+            if not lo<=value<=hi:
+                raise ValueError(f"{stage_name} {label} moet tussen {lo} en {hi} liggen.")
+            payload,ok=_lcm_replace_laser_block_number_by_name(
+                payload,block_name,next_name,field,value
+            )
+            require(ok,f"{stage_name} {label}")
+
+        if stage.get("dutyCyclePct") is not None and str(stage.get("dutyCyclePct")).strip()!="":
+            duty=float(stage["dutyCyclePct"])
+            if not 0<=duty<=100:
+                raise ValueError(f"{stage_name} Duty cycle moet tussen 0 en 100 liggen.")
+            payload,ok=_lcm_replace_laser_block_number_by_name(
+                payload,block_name,next_name,"PwmRatio",duty/100.0
+            )
+            require(ok,f"{stage_name} Duty cycle")
+
+        if stage.get("gas") not in (None,""):
+            gas_number=_lcm_machine_gas_number(stage.get("gas"))
+            payload,ok=_lcm_replace_laser_block_reference_number_by_name(
+                payload,block_name,next_name,"GasType",gas_number
+            )
+            require(ok,f"{stage_name} Piercing Gas")
 
     # CORNER — alleen bewezen named/scalar velden.
     corner=dict(desired.get("cornerParameters") or {})
@@ -4479,6 +4594,8 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
         wanted_gas="O2" if _lcm_machine_gas_number(cut_gas)==2 else "N2"
         if parsed_gas!=wanted_gas:
             raise ValueError("Validatie mislukt voor Cut Gas.")
+    if gas_pressure is not None and not close_num(parsed.get("gasPressureBar"),gas_pressure,0.02):
+        raise ValueError("Validatie mislukt voor Cut Gas pressure.")
     if cut.get("cutHeightMm") is not None and not close_num(
         (parsed.get("cutParameters") or {}).get("cutHeightMm"),cut["cutHeightMm"],0.02
     ):
@@ -4504,11 +4621,40 @@ def _build_machine_lcm(reference_content: bytes, desired: dict, filename: str) -
     if "type" in pierce and int(round(float(parsed_pierce.get("type") or 0)))!=int(pierce["type"]):
         raise ValueError("Validatie mislukt voor Pierce Type.")
     for stage_name in ("stage1","stage2","stage3"):
-        wanted=(pierce.get(stage_name) or {}).get("pierceTimeMs")
-        if wanted is not None and not close_num(
-            (parsed_pierce.get(stage_name) or {}).get("pierceTimeMs"),wanted,0.01
+        wanted= pierce.get(stage_name) or {}
+        actual= parsed_pierce.get(stage_name) or {}
+        if not wanted:
+            continue
+
+        if wanted.get("modeCode") is not None:
+            if int(round(float(actual.get("modeCode") or 0)))!=int(round(float(wanted.get("modeCode")))):
+                raise ValueError(f"Validatie mislukt voor {stage_name} Pierce mode.")
+        elif wanted.get("mode") not in (None,""):
+            raw=str(wanted.get("mode")).strip()
+            expected=0 if raw.lower()=="segment pie" else int(re.search(r"-?\d+",raw).group(0))
+            if int(round(float(actual.get("modeCode") or 0)))!=expected:
+                raise ValueError(f"Validatie mislukt voor {stage_name} Pierce mode.")
+
+        for key,label,tol in (
+            ("timeMs","Stage tijd / follow",0.01),
+            ("heightMm","Piercing Height",0.02),
+            ("pressureBar","Gas pressure",0.02),
+            ("peakPowerPct","Peak power",0.2),
+            ("dutyCyclePct","Duty cycle",0.2),
+            ("frequencyHz","Frequency",1.0),
+            ("beamSize","Beam Size",0.02),
+            ("focusMm","Focus Pos.",0.02),
+            ("endFocusMm","End Focus",0.02),
+            ("pierceTimeMs","Pierce time",0.01),
+            ("laserOffGasOnMs","LaserOff and GasOn",0.01),
         ):
-            raise ValueError(f"Validatie mislukt voor {stage_name} Pierce time.")
+            if wanted.get(key) is not None and str(wanted.get(key)).strip()!="" and not close_num(actual.get(key),wanted.get(key),tol):
+                raise ValueError(f"Validatie mislukt voor {stage_name} {label}.")
+
+        if wanted.get("gas") not in (None,""):
+            expected_gas="O2" if _lcm_machine_gas_number(wanted.get("gas"))==2 else "N2"
+            if str(actual.get("gas") or "").upper().replace("₂","2")!=expected_gas:
+                raise ValueError(f"Validatie mislukt voor {stage_name} Piercing Gas.")
 
     pc=parsed.get("cornerParameters") or {}
 
