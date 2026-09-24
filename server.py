@@ -9028,6 +9028,44 @@ _INV_MAX_PDF = 5_000_000
 _INV_FORWARD_FROM = "info@vakstaal.nl"
 
 
+def _inv_settings():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_account_settings ("
+                     "id INTEGER PRIMARY KEY, destination TEXT NOT NULL, rules_json TEXT NOT NULL, "
+                     "auto INTEGER NOT NULL, move_to_trash INTEGER NOT NULL, access_enabled INTEGER NOT NULL, "
+                     "auto_enabled_at TEXT NOT NULL)")
+        row = conn.execute("SELECT destination,rules_json,auto,move_to_trash,access_enabled,auto_enabled_at "
+                           "FROM invoice_account_settings WHERE id=1").fetchone()
+    if not row:
+        return {"destination": "", "rules": [], "auto": False, "move_to_trash": False,
+                "access_enabled": False, "auto_enabled_at": "", "configured": False}
+    return {"destination": row[0], "rules": json.loads(row[1]), "auto": bool(row[2]),
+            "move_to_trash": bool(row[3]), "access_enabled": bool(row[4]),
+            "auto_enabled_at": row[5], "configured": True}
+
+
+def _inv_supplier_directory():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_supplier_names "
+                     "(sender TEXT PRIMARY KEY, company TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        return {row[0]: row[1] for row in conn.execute(
+            "SELECT sender,company FROM invoice_supplier_names").fetchall()}
+
+
+def _inv_known_supplier(suggestion, sender, directory):
+    address = _inv_email_utils.parseaddr(str(sender or ""))[1].strip().lower()
+    company = directory.get(address)
+    if not company:
+        return suggestion
+    result = {**suggestion, "company": company}
+    result["complete"] = bool(result.get("year") and result.get("number") and company)
+    result["filename"] = (f"{result['year']} {company} {result['number']}.pdf"
+                          if result["complete"] else "")
+    result["missing"] = [key for key in ("year", "company", "number") if not result.get(key)]
+    result["supplier_learned"] = True
+    return result
+
+
 def _inv_smtp_settings():
     """Authenticeer factuurmails als het TransIP-postvak dat e-Boekhouden toelaat."""
     password = os.environ.get(_INV_ADDRESSES[_INV_FORWARD_FROM], "")
@@ -9040,8 +9078,90 @@ def _inv_smtp_settings():
 def _inv_authorize(request: Request):
     secret = os.environ.get("VAKSTAAL_INVOICE_API_KEY", "")
     supplied = request.headers.get("X-Invoice-Key", "")
-    if not secret or not supplied or not _inv_hmac.compare_digest(supplied, secret):
-        raise HTTPException(403, "Factuurkoppeling is niet ingesteld of toegang geweigerd.")
+    if not secret:
+        raise HTTPException(503, "Factuurkoppeling is niet ingesteld.")
+    if supplied:
+        if _inv_hmac.compare_digest(supplied, secret):
+            return
+        raise HTTPException(403, "Factuurtoegangscode is ongeldig.")
+    if not _inv_settings()["access_enabled"]:
+        raise HTTPException(403, "Vul eerst de factuurtoegangscode in.")
+
+
+@app.get("/api/invoice-imap/preferences")
+def invoice_imap_preferences():
+    # Deze route blijft binnen de bestaande verplichte beheerderslogin.
+    return _inv_settings()
+
+
+@app.post("/api/invoice-imap/preferences")
+def invoice_imap_preferences_save(payload: dict, request: Request):
+    _inv_authorize(request)
+    destination = str(payload.get("destination") or "").strip()
+    if destination and not re.fullmatch(r"[^\s@]+@e-boekhouden\.nl", destination, re.I):
+        raise HTTPException(422, "Controleer het e-Boekhouden-adres.")
+    rules = payload.get("rules")
+    if not isinstance(rules, list) or len(rules) > 100 or any(not isinstance(rule, str)
+            or len(rule) > 254 for rule in rules):
+        raise HTTPException(422, "Controleer de leveranciersregels.")
+    rules = [rule.strip().lower() for rule in rules if rule.strip()]
+    for rule in rules:
+        if not re.fullmatch(r"(?:[a-z0-9._%+\-]+@)?[a-z0-9\-]+(?:\.[a-z0-9\-]+)+", rule):
+            raise HTTPException(422, "Controleer de leveranciersregels.")
+    auto = payload.get("auto") is True
+    if auto and (not destination or not rules):
+        raise HTTPException(422, "Voor automatisch versturen zijn bestemming en leveranciers nodig.")
+    remember = payload.get("remember_access") is True
+    auto_enabled_at = str(payload.get("auto_enabled_at") or "")[:40] if auto else ""
+    if auto:
+        try:
+            parsed = datetime.fromisoformat(auto_enabled_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed > datetime.now(timezone.utc):
+                raise ValueError("Ongeldige starttijd")
+        except ValueError as exc:
+            raise HTTPException(422, "Controleer de starttijd voor automatisch versturen.") from exc
+    with _db_connect() as conn:
+        marker = "%s" if _postgres_enabled() else "?"
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_account_settings ("
+                     "id INTEGER PRIMARY KEY, destination TEXT NOT NULL, rules_json TEXT NOT NULL, "
+                     "auto INTEGER NOT NULL, move_to_trash INTEGER NOT NULL, access_enabled INTEGER NOT NULL, "
+                     "auto_enabled_at TEXT NOT NULL)")
+        conn.execute(f"INSERT INTO invoice_account_settings "
+                     f"(id,destination,rules_json,auto,move_to_trash,access_enabled,auto_enabled_at) "
+                     f"VALUES (1,{marker},{marker},{marker},{marker},{marker},{marker}) "
+                     "ON CONFLICT (id) DO UPDATE SET destination=excluded.destination, "
+                     "rules_json=excluded.rules_json,auto=excluded.auto, "
+                     "move_to_trash=excluded.move_to_trash,access_enabled=excluded.access_enabled, "
+                     "auto_enabled_at=excluded.auto_enabled_at",
+                     (destination, json.dumps(rules), int(auto), int(payload.get("move_to_trash") is True),
+                      int(remember), auto_enabled_at))
+    return {"saved": True, "access_enabled": remember}
+
+
+@app.post("/api/invoice-imap/forget")
+def invoice_imap_forget(request: Request):
+    _inv_authorize(request)
+    with _db_connect() as conn:
+        conn.execute("UPDATE invoice_account_settings SET access_enabled=0 WHERE id=1")
+    return {"access_enabled": False}
+
+
+@app.post("/api/invoice-imap/supplier-name")
+def invoice_imap_supplier_name(payload: dict, request: Request):
+    _inv_authorize(request)
+    sender = _inv_email_utils.parseaddr(str(payload.get("sender") or ""))[1].strip().lower()
+    company = _inv_name_part(payload.get("company"), 55).lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", sender) or not 2 <= len(company) <= 55:
+        raise HTTPException(422, "Controleer afzender en bedrijfsnaam.")
+    with _db_connect() as conn:
+        marker = "%s" if _postgres_enabled() else "?"
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_supplier_names "
+                     "(sender TEXT PRIMARY KEY, company TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        conn.execute(f"INSERT INTO invoice_supplier_names(sender,company,updated_at) "
+                     f"VALUES ({marker},{marker},{marker}) ON CONFLICT (sender) DO UPDATE SET "
+                     "company=excluded.company,updated_at=excluded.updated_at",
+                     (sender, company, datetime.now(timezone.utc).isoformat()))
+    return {"saved": True, "company": company}
 
 
 def _inv_mailbox(address: str, *, writable: bool = False):
@@ -9515,6 +9635,7 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
     analysis, fresh_analysis = _inv_analysis_cache(), []
     names, fresh_names = _inv_name_cache(), []
     amounts, fresh_amounts = _inv_amount_cache(), []
+    suppliers = _inv_supplier_directory()
     for address in ((mailbox,) if mailbox else _INV_ADDRESSES):
         try:
             imap = _inv_mailbox(address)
@@ -9563,12 +9684,15 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
                                 amounts[digest] = _inv_total_amount(text)
                                 fresh_amounts.append((digest, amounts[digest]))
                             amount = amounts[digest]
+                        visible_name = _inv_known_supplier(name, sender, suppliers) if name else None
+                        if visible_name and source != "PDF-tekst":
+                            visible_name["complete"] = False
                         docs.append({"mailbox": address, "uid": uid, "digest": digest,
                                      "sender": sender, "received": received,
                                      "subject": str(msg.get("Subject", ""))[:200],
                                      "filename": filename[:200], "size": len(pdf),
                                      "classification": kind, "reason": reason,
-                                     "text_source": source, "invoice_name": name,
+                                     "text_source": source, "invoice_name": visible_name,
                                      "amount": amount})
             finally:
                 try: imap.logout()
@@ -9670,7 +9794,8 @@ def invoice_imap_name(payload: dict, request: Request):
         str(payload.get("uid", "")), str(payload.get("digest", ""))) if payload.get("previously_sent") is True else _inv_document(
         str(payload.get("mailbox", "")), str(payload.get("uid", "")), str(payload.get("digest", "")))
     text, source = _inv_pdf_text(pdf)
-    suggestion = _inv_name_suggestion(text, str(original.get("From", "")))
+    suggestion = _inv_known_supplier(_inv_name_suggestion(text, str(original.get("From", ""))),
+                                     str(original.get("From", "")), _inv_supplier_directory())
     suggestion["basis"] = source
     if source != "PDF-tekst":
         suggestion["complete"] = False  # OCR en onleesbare PDF's altijd zelf controleren.
