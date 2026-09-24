@@ -9179,6 +9179,45 @@ def _inv_kind(text: str, filename: str, source: str = "PDF-tekst"):
     return kind, reason
 
 
+def _inv_total_amount(text: str):
+    """Geef alleen een ondubbelzinnig factuurtotaal uit de PDF terug."""
+    labels = (
+        (3, re.compile(r"\b(?:totaal\s+te\s+betalen|te\s+betalen|amount\s+due|balance\s+due)\b", re.I)),
+        (2, re.compile(r"\b(?:totaal\s*(?:incl\.?\s*btw|inclusief\s*btw|bedrag)|factuurtotaal|invoice\s+total|grand\s+total|total\s+incl\.?\s*vat)\b", re.I)),
+        (1, re.compile(r"\b(?:totaal|total)\b", re.I)),
+    )
+    money = re.compile(r"(?<![\w])(?:€\s*|EUR\s*)?([+-]?(?:\d{1,3}(?:[.,\s]\d{3})+|\d+)[,.]\d{2})(?!\d)", re.I)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    candidates = []
+    for index, line in enumerate(lines):
+        if re.search(r"\b(?:subtotaal|subtotal|excl(?:usief)?\.?\s*(?:btw|vat)|btw\s*(?:bedrag|amount)|vat\s*amount)\b", line, re.I):
+            continue
+        for rank, pattern in labels:
+            label = pattern.search(line)
+            if not label:
+                continue
+            tail = line[label.end():]
+            values = money.findall(tail)
+            if not values and index + 1 < len(lines):
+                following = lines[index + 1]
+                if re.fullmatch(r"(?:€\s*|EUR\s*)?[+-]?[\d.,\s]+", following, re.I):
+                    values = money.findall(following)
+            if len(values) == 1:
+                raw = values[0]
+                separator = max(raw.rfind(","), raw.rfind("."))
+                integer = re.sub(r"[^\d]", "", raw[:separator])
+                cents = raw[separator+1:]
+                if integer and len(cents) == 2:
+                    sign = "-" if raw.startswith("-") else ""
+                    candidates.append((rank, f"{sign}{int(integer)},{cents}"))
+            break
+    if not candidates:
+        return None
+    highest = max(rank for rank, _ in candidates)
+    distinct = {value for rank, value in candidates if rank == highest}
+    return next(iter(distinct)) if len(distinct) == 1 else None
+
+
 def _inv_name_part(value: str, maximum: int = 64) -> str:
     plain = _inv_unicode.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
     plain = re.sub(r"[/\\\\]+", "-", plain)
@@ -9187,7 +9226,7 @@ def _inv_name_part(value: str, maximum: int = 64) -> str:
 
 
 def _inv_name_suggestion(text: str, sender: str):
-    """Factuurdatum en nummer komen uit de PDF; leverancier uit kop/afzender."""
+    """Gebruik alleen aantoonbare PDF-gegevens; maildomeinen zijn geen leverancier."""
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
     opening = "\n".join(lines[:45])[:4500]
     year = ""
@@ -9211,37 +9250,43 @@ def _inv_name_suggestion(text: str, sender: str):
     number_label = re.compile(r"\b(?:factuur\s*(?:nummer|nr\.?|no\.?)|factuurnr\.?|"
                               r"invoice\s*(?:number|no\.?|#)|creditnota\s*(?:nummer|nr\.?))"
                               r"\s*[:#.-]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{1,45})", re.I)
+    number_only = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{1,47}")
     for position, line in enumerate(lines[:55]):
         match = number_label.search(line)
         if match and re.search(r"\d", match.group(1)):
             number = _inv_name_part(match.group(1), 48)
             break
-        if not match and re.search(r"\b(?:factuurnummer|factuurnr\.?|invoice\s*(?:no|number))\s*:?\s*$",line,re.I):
-            next_line = lines[position+1] if position+1 < len(lines) else ""
-            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{1,47}", next_line) and re.search(r"\d", next_line):
-                number = _inv_name_part(next_line, 48)
+        if re.search(r"\b(?:factuurnummer|factuurnr\.?|invoice\s*(?:no|number))\b", line, re.I):
+            # PDF's with a label column often put its value on the next line.
+            for candidate in lines[position+1:position+4]:
+                if re.search(r"\b(?:datum|date|bedrag|amount|klant|customer|totaal|total)\b", candidate, re.I):
+                    break
+                value = number_only.fullmatch(candidate.strip(" :#"))
+                if value and re.search(r"\d", value.group()):
+                    number = _inv_name_part(value.group(), 48)
+                    break
+            if number:
                 break
-    address = _inv_email_utils.parseaddr(str(sender or ""))[1].lower()
-    labels = address.rsplit("@", 1)[-1].split(".") if "@" in address else []
-    domain = (labels[-3] if len(labels) >= 3 and labels[-2] in {"co", "com", "org"}
-              and labels[-1] in {"uk", "au"} else labels[-2] if len(labels) >= 2 else "")
-    generic = {"gmail", "hotmail", "outlook", "live", "icloud", "yahoo", "transip",
-               "factuursturen", "moneybird", "exactonline", "eboekhouden", "vakstaal"}
-    domain = domain if domain not in generic else ""
     header_company = ""
     for line in lines[:12]:
         company = re.match(r"^(.{2,65}?)\s+(?:B\.?V\.?|GmbH|Ltda?|Inc\.?|N\.?V\.?)\b", line, re.I)
         if company and not re.search(r"\b(?:vakstaal|factuur|invoice|klant|aan:|ship\s+to)\b", company.group(1), re.I):
             header_company = _inv_name_part(company.group(1), 55).lower()
             break
-    company = (domain if domain and (not header_company or domain in header_company.replace(" ", ""))
-               else header_company)
-    if not company:
-        company = header_company
-    company = _inv_name_part(company, 55).lower()
+    if not header_company:
+        for position, line in enumerate(lines[:24]):
+            labelled = re.match(r"^(?:leverancier|afzender|supplier|seller|from)\s*:?\s*(.{2,65})$", line, re.I)
+            candidate = labelled.group(1) if labelled else (lines[position+1] if re.fullmatch(
+                r"(?:leverancier|afzender|supplier|seller|from)\s*:?", line, re.I)
+                and position+1 < len(lines) else "")
+            if candidate and not re.search(r"\b(?:vakstaal|factuur|invoice|pay|betaling|klant)\b", candidate, re.I):
+                header_company = _inv_name_part(candidate, 55).lower()
+                break
+    company = _inv_name_part(header_company, 55).lower()
     fields = {"year": year, "company": company, "number": number}
     return {**fields, "complete": bool(all(fields.values())),
-            "filename": f"{year} {company} {number}.pdf" if all(fields.values()) else ""}
+            "filename": f"{year} {company} {number}.pdf" if all(fields.values()) else "",
+            "basis": "PDF-tekst", "missing": [key for key, value in fields.items() if not value]}
 
 
 def _inv_final_filename(text: str, sender: str, supplied=None):
@@ -9287,6 +9332,44 @@ def _inv_save_analysis(rows):
                          f"(reference, classification, reason, text_source) "
                          f"VALUES ({marker}, {marker}, {marker}, {marker}) "
                          "ON CONFLICT (reference) DO NOTHING", entry)
+
+
+def _inv_name_cache():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_pdf_names "
+                     "(reference TEXT PRIMARY KEY, details TEXT NOT NULL)")
+        return {row[0]: json.loads(row[1]) for row in conn.execute(
+            "SELECT reference, details FROM invoice_pdf_names").fetchall()}
+
+
+def _inv_save_names(rows):
+    if not rows:
+        return
+    with _db_connect() as conn:
+        marker = "%s" if _postgres_enabled() else "?"
+        for key, details in rows:
+            conn.execute(f"INSERT INTO invoice_pdf_names(reference,details) VALUES ({marker},{marker}) "
+                         "ON CONFLICT (reference) DO UPDATE SET details=excluded.details",
+                         (key, json.dumps(details, ensure_ascii=False)))
+
+
+def _inv_amount_cache():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_pdf_amounts "
+                     "(reference TEXT PRIMARY KEY, amount TEXT NOT NULL)")
+        return {row[0]: json.loads(row[1]) for row in conn.execute(
+            "SELECT reference, amount FROM invoice_pdf_amounts").fetchall()}
+
+
+def _inv_save_amounts(rows):
+    if not rows:
+        return
+    with _db_connect() as conn:
+        marker = "%s" if _postgres_enabled() else "?"
+        for digest, amount in rows:
+            conn.execute(f"INSERT INTO invoice_pdf_amounts(reference,amount) VALUES ({marker},{marker}) "
+                         "ON CONFLICT (reference) DO UPDATE SET amount=excluded.amount",
+                         (digest, json.dumps(amount)))
 
 
 def _inv_confirmed_digests():
@@ -9420,15 +9503,19 @@ def invoice_imap_status(request: Request):
 
 
 @app.get("/api/invoice-imap/scan")
-def invoice_imap_scan(request: Request):
+def invoice_imap_scan(request: Request, mailbox: str = ""):
     _inv_authorize(request)
     if _InvPdfReader is None:
         raise HTTPException(503, "PDF-herkenning ontbreekt op de server: installeer pypdf.")
+    if mailbox and mailbox not in _INV_ADDRESSES:
+        raise HTTPException(400, "Onbekend postvak.")
     since = (datetime.now(timezone.utc)-_inv_timedelta(days=30)).strftime("%d-%b-%Y")
     docs, errors = [], []
     dismissed = _inv_dismissed_digests()
     analysis, fresh_analysis = _inv_analysis_cache(), []
-    for address in _INV_ADDRESSES:
+    names, fresh_names = _inv_name_cache(), []
+    amounts, fresh_amounts = _inv_amount_cache(), []
+    for address in ((mailbox,) if mailbox else _INV_ADDRESSES):
         try:
             imap = _inv_mailbox(address)
             try:
@@ -9449,28 +9536,53 @@ def invoice_imap_scan(request: Request):
                         # Toon ook een tweede mailkopie uit het andere postvak.
                         # De verzendregistratie blijft per PDF-digest uniek.
                         analysis_key = _inv_analysis_key(digest, filename)
+                        text = None
                         if analysis_key not in analysis:
                             text, source = _inv_pdf_text(pdf)
                             kind, reason = _inv_kind(text, filename, source)
                             analysis[analysis_key] = (kind, reason, source)
                             fresh_analysis.append((analysis_key, kind, reason, source))
                         kind, reason, source = analysis[analysis_key]
+                        name = None
+                        if kind == "invoice":
+                            name = names.get(digest)
+                            if name is None:
+                                if text is None:
+                                    text, source = _inv_pdf_text(pdf)
+                                name = _inv_name_suggestion(text, sender)
+                                name["basis"] = source
+                                if source != "PDF-tekst":
+                                    name["complete"] = False
+                                names[digest] = name
+                                fresh_names.append((digest, name))
+                        amount = None
+                        if kind in {"invoice", "review"}:
+                            if digest not in amounts:
+                                if text is None:
+                                    text, _ = _inv_pdf_text(pdf)
+                                amounts[digest] = _inv_total_amount(text)
+                                fresh_amounts.append((digest, amounts[digest]))
+                            amount = amounts[digest]
                         docs.append({"mailbox": address, "uid": uid, "digest": digest,
                                      "sender": sender, "received": received,
                                      "subject": str(msg.get("Subject", ""))[:200],
                                      "filename": filename[:200], "size": len(pdf),
                                      "classification": kind, "reason": reason,
-                                     "text_source": source})
+                                     "text_source": source, "invoice_name": name,
+                                     "amount": amount})
             finally:
                 try: imap.logout()
                 except Exception: pass
         except Exception:
             errors.append(f"{address}: postvak niet ingesteld of niet bereikbaar")
     _inv_save_analysis(fresh_analysis)
+    _inv_save_names(fresh_names)
+    _inv_save_amounts(fresh_amounts)
     confirmed = _inv_confirmed_digests()
     for doc in docs:
         doc["sent"] = doc["digest"] in confirmed
-    return {"documents": docs, "errors": errors}
+    return {"documents": docs, "errors": errors,
+            "scanned_mailboxes": [mailbox] if mailbox else list(_INV_ADDRESSES)}
 
 
 @app.post("/api/invoice-imap/dismiss")
@@ -9557,8 +9669,12 @@ def invoice_imap_name(payload: dict, request: Request):
     original, _, pdf = _inv_resend_document(str(payload.get("mailbox", "")),
         str(payload.get("uid", "")), str(payload.get("digest", ""))) if payload.get("previously_sent") is True else _inv_document(
         str(payload.get("mailbox", "")), str(payload.get("uid", "")), str(payload.get("digest", "")))
-    text, _ = _inv_pdf_text(pdf)
-    return _inv_name_suggestion(text, str(original.get("From", "")))
+    text, source = _inv_pdf_text(pdf)
+    suggestion = _inv_name_suggestion(text, str(original.get("From", "")))
+    suggestion["basis"] = source
+    if source != "PDF-tekst":
+        suggestion["complete"] = False  # OCR en onleesbare PDF's altijd zelf controleren.
+    return suggestion
 
 
 @app.post("/api/invoice-imap/send")
