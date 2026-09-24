@@ -5,6 +5,9 @@ import html
 
 import os
 import shutil
+import tempfile
+import logging
+import unicodedata
 import time
 import uuid
 import json
@@ -8417,6 +8420,10 @@ def root():
         "endpoints": [
             "/health",
             "/api/analyze-step",
+            "/api/filter-step/{job_id}",
+            "/api/filter-step-file",
+            "/api/step-source/{job_id}",
+            "/api/quotes/{quote_id}/filtered-step",
             "/api/assembly-mesh/{job_id}",
             "/api/solid-mesh/{job_id}/{solid_index}",
             "/api/quotes",
@@ -8439,6 +8446,127 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "service": "Vakstaal STEP Server"}
+
+
+# v9: exact STEP selection export. No re-analysis, reconstruction or quote writes.
+# The ordering is the same importStep(...).solids().vals() used by the analyzer.
+_V9_STEP_LOG = logging.getLogger("vakstaal.step_selection")
+
+
+def _v9_step_name_key(value: str) -> str:
+    return unicodedata.normalize("NFC", str(value or "").replace("\\", "/").rsplit("/", 1)[-1]).casefold()
+
+
+def _v9_selection_indices(payload: dict) -> list[int]:
+    raw = payload.get("solid_indices") if isinstance(payload, dict) else None
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(422, "Geen onderdelen geselecteerd voor het STEP-selectiebestand.")
+    if len(raw) > 100000 or any(type(i) is not int or i < 1 for i in raw):
+        raise HTTPException(422, "STEP-onderdeelnummers moeten positieve gehele getallen zijn.")
+    return sorted(set(raw))
+
+
+def _v9_cached_step(job_id: str) -> Path:
+    # job IDs from /api/analyze-step are UUID hex strings, never filesystem paths.
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", job_id or ""):
+        raise HTTPException(404, "STEP-sessie niet gevonden of verlopen.")
+    return job_step_path(job_id)
+
+
+def _v9_step_bytes_response(data: bytes, filename: str, count: int | None = None) -> Response:
+    name = str(filename or "selectie.step").replace("\\", "/").rsplit("/", 1)[-1]
+    name = name.replace("\r", "").replace("\n", "")
+    ascii_name = name.encode("ascii", "replace").decode("ascii").replace('"', "_")
+    headers = {
+        "Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{urllib.parse.quote(name, safe="")}',
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store",
+    }
+    if count is not None:
+        headers["X-STEP-Selected-Count"] = str(count)
+    return Response(content=data, media_type="application/step", headers=headers)
+
+
+def _v9_export_step_selection(data: bytes, indices: list[int], filename: str) -> Response:
+    if not data:
+        raise HTTPException(422, "Het originele STEP-bestand is leeg.")
+    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(413, f"STEP-bestand is groter dan {MAX_UPLOAD_MB} MB.")
+    try:
+        with tempfile.TemporaryDirectory(prefix="vakstaal_step_selection_") as work:
+            source = Path(work) / "source.step"
+            target = Path(work) / "selection.step"
+            source.write_bytes(data)
+            solids = cq.importers.importStep(str(source)).solids().vals()
+            if not solids:
+                raise HTTPException(422, "Het originele STEP-bestand bevat geen solids.")
+            invalid = [i for i in indices if i > len(solids)]
+            if invalid:
+                raise HTTPException(422, "Geselecteerde onderdelen bestaan niet in dit oorspronkelijke STEP-bestand: "
+                                    + ", ".join(map(str, invalid[:12]))
+                                    + f". Het bestand bevat {len(solids)} onderdelen; controleer de bronversie.")
+            chosen = [solids[i - 1] for i in indices]
+            shape = chosen[0] if len(chosen) == 1 else cq.Compound.makeCompound(chosen)
+            cq.exporters.export(shape, str(target), exportType="STEP")
+            result = target.read_bytes()
+        if not result:
+            raise RuntimeError("Empty STEP export")
+        _V9_STEP_LOG.info("step_selection.complete source_count=%d selected_count=%d", len(solids), len(chosen))
+        stem = Path(str(filename).replace("\\", "/").rsplit("/", 1)[-1]).stem or "STEP"
+        return _v9_step_bytes_response(result, stem + "_OFFERTSELECTIE.step", len(chosen))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _V9_STEP_LOG.exception("step_selection.failed")
+        raise HTTPException(422, "Het STEP-selectiebestand kon niet worden gemaakt. Controleer het originele STEP-bestand; er is niets aan de offerte gewijzigd.") from exc
+
+
+@app.get("/api/step-source/{job_id}")
+def v9_download_step_source(job_id: str):
+    path = _v9_cached_step(job_id)
+    return _v9_step_bytes_response(path.read_bytes(), "bron.step")
+
+
+@app.post("/api/filter-step/{job_id}")
+def v9_filter_step_session(job_id: str, payload: dict):
+    indices = _v9_selection_indices(payload)
+    path = _v9_cached_step(job_id)
+    return _v9_export_step_selection(path.read_bytes(), indices, "STEP.step")
+
+
+@app.post("/api/filter-step-file")
+def v9_filter_step_upload(file: UploadFile = File(...), solid_indices: str = Form(...)):
+    # sync route: CAD work runs in FastAPI's worker thread, not its async event loop.
+    name = file.filename or "bron.step"
+    if Path(name).suffix.lower() not in {".step", ".stp"}:
+        raise HTTPException(422, "Kies het oorspronkelijke STEP-bestand (.step of .stp).")
+    try:
+        raw = json.loads(solid_indices)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "Ongeldige STEP-selectie.") from exc
+    indices = _v9_selection_indices({"solid_indices": raw})
+    data = file.file.read(MAX_UPLOAD_MB * 1024 * 1024 + 1)
+    return _v9_export_step_selection(data, indices, name)
+
+
+@app.post("/api/quotes/{quote_id}/filtered-step")
+def v9_filter_saved_quote_step(quote_id: str, payload: dict):
+    indices = _v9_selection_indices(payload)
+    name = str(payload.get("source_filename") or "").strip()
+    if Path(name).suffix.lower() not in {".step", ".stp"}:
+        raise HTTPException(422, "De naam van het originele STEP-bronbestand ontbreekt.")
+    # Search only this quote, and only an exact original filename. A production
+    # or previously filtered file is never substituted by a similar stem.
+    with _db_connect() as conn:
+        key = _v9_step_name_key(_safe_dropbox_name(name, "bestand"))
+        candidates = [f for f in _quote_files(conn, quote_id) if _v9_step_name_key(f.get("filename")) == key]
+    if not candidates:
+        raise HTTPException(404, "Het originele STEP-bronbestand is niet aan deze offerte gekoppeld.")
+    if len(candidates) != 1:
+        raise HTTPException(409, "Het originele STEP-bronbestand is niet eenduidig. Er wordt geen willekeurig bestand gekozen.")
+    # Reuse the existing scoped database/Dropbox read path. Nothing is saved here.
+    original = download_quote_file(quote_id, candidates[0]["id"])
+    return _v9_export_step_selection(bytes(original.body), indices, name)
 
 
 @app.post("/api/analyze-step")
@@ -9398,7 +9526,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Invoice-Key"],
-    expose_headers=["Content-Disposition", "Retry-After"],
+    expose_headers=["Content-Disposition", "Retry-After", "X-STEP-Selected-Count"],
 )
 
 if __name__ == "__main__":
