@@ -4,3 +4,4 @@ python-multipart
 numpy
 cadquery
 psycopg[binary]
+pypdf
