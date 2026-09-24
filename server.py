@@ -9011,6 +9011,7 @@ import hashlib as _inv_hashlib
 import hmac as _inv_hmac
 import io as _inv_io
 import subprocess as _inv_subprocess
+import unicodedata as _inv_unicode
 from datetime import timedelta as _inv_timedelta
 from email import policy as _inv_policy
 from email.utils import parsedate_to_datetime as _inv_parsedate
@@ -9024,6 +9025,16 @@ _INV_ADDRESSES = {
     "info@vakstaal.nl": "VAKSTAAL_IMAP_INFO_PASSWORD",
 }
 _INV_MAX_PDF = 5_000_000
+_INV_FORWARD_FROM = "info@vakstaal.nl"
+
+
+def _inv_smtp_settings():
+    """Authenticeer factuurmails als het TransIP-postvak dat e-Boekhouden toelaat."""
+    password = os.environ.get(_INV_ADDRESSES[_INV_FORWARD_FROM], "")
+    if not password:
+        raise HTTPException(503, "Het TransIP-wachtwoord van info@vakstaal.nl ontbreekt op de server.")
+    return {"host": "smtp.transip.email", "port": 465, "user": _INV_FORWARD_FROM,
+            "password": password, "from": _INV_FORWARD_FROM, "ssl": True}
 
 
 def _inv_authorize(request: Request):
@@ -9166,6 +9177,91 @@ def _inv_kind(text: str, filename: str, source: str = "PDF-tekst"):
     if source == "OCR-scan" and kind == "invoice":
         return "review", "Scan lijkt een factuur; controleer het origineel vanwege mogelijke OCR-fouten."
     return kind, reason
+
+
+def _inv_name_part(value: str, maximum: int = 64) -> str:
+    plain = _inv_unicode.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+    plain = re.sub(r"[/\\\\]+", "-", plain)
+    plain = re.sub(r"[^A-Za-z0-9._ -]+", " ", plain)
+    return re.sub(r"\s+", " ", plain).strip(" ._-")[:maximum].strip(" ._-")
+
+
+def _inv_name_suggestion(text: str, sender: str):
+    """Factuurdatum en nummer komen uit de PDF; leverancier uit kop/afzender."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    opening = "\n".join(lines[:45])[:4500]
+    year = ""
+    date = re.search(r"\b(?:factuurdatum|invoice\s*date|date\s*of\s*issue|datum\s*factuur)\b"
+                     r"[^\n\d]{0,28}(?:\d{1,2}[./-]\d{1,2}[./-](20\d{2})|"
+                     r"(20\d{2})[./-]\d{1,2}[./-]\d{1,2}|\d{1,2}\s+[A-Za-zÀ-ÿ]+\s+(20\d{2}))",
+                     opening, re.I)
+    if date:
+        year = next((part for part in date.groups() if part), "")
+    if not year:
+        for position, line in enumerate(lines[:30]):
+            if not re.search(r"\b(?:factuurdatum|invoice\s*date|date\s*of\s*issue|datum)\b", line, re.I):
+                continue
+            nearby = line + " " + (lines[position+1] if position+1 < len(lines) else "")
+            found = re.search(r"(?:\d{1,2}[./-]\d{1,2}[./-]|\d{1,2}\s+[A-Za-zÀ-ÿ]+\s+)(20\d{2})"
+                              r"|\b(20\d{2})[./-]\d{1,2}[./-]\d{1,2}", nearby)
+            if found:
+                year = next(part for part in found.groups() if part)
+                break
+    number = ""
+    number_label = re.compile(r"\b(?:factuur\s*(?:nummer|nr\.?|no\.?)|factuurnr\.?|"
+                              r"invoice\s*(?:number|no\.?|#)|creditnota\s*(?:nummer|nr\.?))"
+                              r"\s*[:#.-]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{1,45})", re.I)
+    for position, line in enumerate(lines[:55]):
+        match = number_label.search(line)
+        if match and re.search(r"\d", match.group(1)):
+            number = _inv_name_part(match.group(1), 48)
+            break
+        if not match and re.search(r"\b(?:factuurnummer|factuurnr\.?|invoice\s*(?:no|number))\s*:?\s*$",line,re.I):
+            next_line = lines[position+1] if position+1 < len(lines) else ""
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{1,47}", next_line) and re.search(r"\d", next_line):
+                number = _inv_name_part(next_line, 48)
+                break
+    address = _inv_email_utils.parseaddr(str(sender or ""))[1].lower()
+    labels = address.rsplit("@", 1)[-1].split(".") if "@" in address else []
+    domain = (labels[-3] if len(labels) >= 3 and labels[-2] in {"co", "com", "org"}
+              and labels[-1] in {"uk", "au"} else labels[-2] if len(labels) >= 2 else "")
+    generic = {"gmail", "hotmail", "outlook", "live", "icloud", "yahoo", "transip",
+               "factuursturen", "moneybird", "exactonline", "eboekhouden", "vakstaal"}
+    domain = domain if domain not in generic else ""
+    header_company = ""
+    for line in lines[:12]:
+        company = re.match(r"^(.{2,65}?)\s+(?:B\.?V\.?|GmbH|Ltda?|Inc\.?|N\.?V\.?)\b", line, re.I)
+        if company and not re.search(r"\b(?:vakstaal|factuur|invoice|klant|aan:|ship\s+to)\b", company.group(1), re.I):
+            header_company = _inv_name_part(company.group(1), 55).lower()
+            break
+    company = (domain if domain and (not header_company or domain in header_company.replace(" ", ""))
+               else header_company)
+    if not company:
+        company = header_company
+    company = _inv_name_part(company, 55).lower()
+    fields = {"year": year, "company": company, "number": number}
+    return {**fields, "complete": bool(all(fields.values())),
+            "filename": f"{year} {company} {number}.pdf" if all(fields.values()) else ""}
+
+
+def _inv_final_filename(text: str, sender: str, supplied=None):
+    suggested = _inv_name_suggestion(text, sender)
+    if supplied is not None and not isinstance(supplied, dict):
+        raise HTTPException(400, "Ongeldige factuurnaam.")
+    fields = {key: str((supplied or {}).get(key) or suggested[key]).strip()
+              for key in ("year", "company", "number")}
+    if not re.fullmatch(r"20\d{2}", fields["year"]):
+        raise HTTPException(422, "Factuurjaartal ontbreekt; vul dit uit de PDF in.")
+    if not re.fullmatch(r"[\w .&-]{2,70}", fields["company"], re.UNICODE):
+        raise HTTPException(422, "Bedrijfsnaam ontbreekt of is ongeldig; controleer de PDF.")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{1,47}", fields["number"]) or not re.search(r"\d", fields["number"]):
+        raise HTTPException(422, "Factuurnummer ontbreekt of is ongeldig; controleer de PDF.")
+    company = _inv_name_part(fields["company"], 55).lower()
+    number = _inv_name_part(fields["number"], 48)
+    if len(company) < 2 or len(number) < 2:
+        raise HTTPException(422, "Vul bedrijfsnaam en factuurnummer in.")
+    return {"year": fields["year"], "company": company, "number": number,
+            "filename": f"{fields['year']} {company} {number}.pdf"}
 
 
 def _inv_analysis_key(digest: str, filename: str) -> str:
@@ -9318,7 +9414,9 @@ def _inv_resend_document(address: str, uid: str, digest: str):
 def invoice_imap_status(request: Request):
     _inv_authorize(request)
     return {"accounts": [{"address": address, "configured": bool(os.environ.get(env))}
-                          for address, env in _INV_ADDRESSES.items()], "pdf_reader": _InvPdfReader is not None}
+                          for address, env in _INV_ADDRESSES.items()], "pdf_reader": _InvPdfReader is not None,
+            "forwarding_from": _INV_FORWARD_FROM,
+            "forwarding_ready": bool(os.environ.get(_INV_ADDRESSES[_INV_FORWARD_FROM]))}
 
 
 @app.get("/api/invoice-imap/scan")
@@ -9453,6 +9551,16 @@ def invoice_imap_pdf(payload: dict, request: Request):
                     headers={"Content-Disposition": "inline; filename=invoice.pdf", "Cache-Control": "no-store"})
 
 
+@app.post("/api/invoice-imap/name")
+def invoice_imap_name(payload: dict, request: Request):
+    _inv_authorize(request)
+    original, _, pdf = _inv_resend_document(str(payload.get("mailbox", "")),
+        str(payload.get("uid", "")), str(payload.get("digest", ""))) if payload.get("previously_sent") is True else _inv_document(
+        str(payload.get("mailbox", "")), str(payload.get("uid", "")), str(payload.get("digest", "")))
+    text, _ = _inv_pdf_text(pdf)
+    return _inv_name_suggestion(text, str(original.get("From", "")))
+
+
 @app.post("/api/invoice-imap/send")
 def invoice_imap_send(payload: dict, request: Request):
     _inv_authorize(request)
@@ -9473,9 +9581,8 @@ def invoice_imap_send(payload: dict, request: Request):
     manual = payload.get("confirmed_by_user") is True
     if kind != "invoice" and not ((manual or repeat) and kind in {"review", "unreadable"} and source != "versleuteld"):
         raise HTTPException(409, "Open en bevestig een twijfelgeval eerst zelf; andere documenten mogen niet worden doorgestuurd.")
-    cfg = _quote_mail_smtp_settings()
-    if not cfg.get("host") or not cfg.get("user") or not cfg.get("password"):
-        raise HTTPException(503, "SMTP-verzending is niet ingesteld op de server.")
+    final_name = _inv_final_filename(text, str(original.get("From", "")), payload.get("invoice_name"))
+    cfg = _inv_smtp_settings()
     # Reserveer vóór het verzenden: bij een timeout kan SMTP al afgeleverd hebben.
     reference = digest + (":repeat:" + repeat_id if repeat else "")
     with _db_connect() as conn:
@@ -9490,18 +9597,20 @@ def invoice_imap_send(payload: dict, request: Request):
     mail["To"] = destination
     mail["Subject"] = "Inkoopfactuur: " + str(original.get("Subject", ""))[:120].replace("\n", " ").replace("\r", " ")
     mail.set_content("Afzender: " + _inv_email_utils.parseaddr(str(original.get("From", "")))[1] + "\nBronpostvak: " + str(payload.get("mailbox", "")))
-    mail.add_attachment(pdf, maintype="application", subtype="pdf", filename=os.path.basename(filename))
+    mail.add_attachment(pdf, maintype="application", subtype="pdf", filename=final_name["filename"])
     try:
         context = ssl.create_default_context()
         if cfg.get("ssl"):
             with smtplib.SMTP_SSL(cfg["host"], int(cfg["port"]), timeout=25, context=context) as smtp:
                 smtp.login(cfg["user"], cfg["password"])
-                smtp.send_message(mail)
+                refused = smtp.send_message(mail)
         else:
             with smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=25) as smtp:
                 smtp.starttls(context=context)
                 smtp.login(cfg["user"], cfg["password"])
-                smtp.send_message(mail)
+                refused = smtp.send_message(mail)
+        if refused:
+            raise ValueError("De ontvangende mailserver heeft de ontvanger geweigerd.")
     except Exception as exc:
         raise HTTPException(502, "SMTP-verzending mislukt; controleer eerst of de mail toch is aangekomen.") from exc
     with _db_connect() as conn:
@@ -9513,7 +9622,9 @@ def invoice_imap_send(payload: dict, request: Request):
     moved, move_message = (False, "")
     if not repeat and payload.get("move_to_trash") is True:
         moved, move_message = _inv_move_completed_mail(str(payload.get("mailbox", "")), str(payload.get("uid", "")))
-    return {"sent": True, "resent": repeat, "moved_to_trash": moved, "move_message": move_message}
+    return {"sent": True, "resent": repeat, "submitted_to_smtp": True,
+            "forwarding_from": cfg["from"], "filename": final_name["filename"],
+            "moved_to_trash": moved, "move_message": move_message}
 
 
 from vakstaal_auth import install_auth
