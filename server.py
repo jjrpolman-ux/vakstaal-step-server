@@ -9056,9 +9056,10 @@ def _inv_known_supplier(suggestion, sender, directory):
     address = _inv_email_utils.parseaddr(str(sender or ""))[1].strip().lower()
     company = directory.get(address)
     if not company:
-        return suggestion
+        return dict(suggestion)
     result = {**suggestion, "company": company}
-    result["complete"] = bool(result.get("year") and result.get("number") and company)
+    result["complete"] = bool(result.get("year") and result.get("number") and company
+                              and result.get("number_basis") != "bestandsnaam")
     result["filename"] = (f"{result['year']} {company} {result['number']}.pdf"
                           if result["complete"] else "")
     result["missing"] = [key for key in ("year", "company", "number") if not result.get(key)]
@@ -9303,7 +9304,8 @@ def _inv_total_amount(text: str):
     """Geef alleen een ondubbelzinnig factuurtotaal uit de PDF terug."""
     labels = (
         (3, re.compile(r"\b(?:totaal\s+te\s+betalen|te\s+betalen|amount\s+due|balance\s+due)\b", re.I)),
-        (2, re.compile(r"\b(?:totaal\s*(?:incl\.?\s*btw|inclusief\s*btw|bedrag)|factuurtotaal|invoice\s+total|grand\s+total|total\s+incl\.?\s*vat)\b", re.I)),
+        (2, re.compile(r"\b(?:totaal\s*(?:incl\.?\s*btw|inclusief\s*btw|bedrag)|factuurtotaal|factuurbedrag|"
+                       r"verschuldigd\s+bedrag|invoice\s+total|total\s+amount|grand\s+total|total\s+incl\.?\s*vat)\b", re.I)),
         (1, re.compile(r"\b(?:totaal|total)\b", re.I)),
     )
     money = re.compile(r"(?<![\w])(?:€\s*|EUR\s*)?([+-]?(?:\d{1,3}(?:[.,\s]\d{3})+|\d+)[,.]\d{2})(?!\d)", re.I)
@@ -9407,6 +9409,27 @@ def _inv_name_suggestion(text: str, sender: str):
     return {**fields, "complete": bool(all(fields.values())),
             "filename": f"{year} {company} {number}.pdf" if all(fields.values()) else "",
             "basis": "PDF-tekst", "missing": [key for key, value in fields.items() if not value]}
+
+
+def _inv_name_with_filename(text: str, sender: str, filename: str):
+    """Een bestandsnaam kan helpen bij handmatige controle, maar is geen PDF-bewijs."""
+    suggestion = _inv_name_suggestion(text, sender)
+    if suggestion["number"]:
+        return suggestion
+    base = re.sub(r"\.pdf$", "", str(filename or ""), flags=re.I).strip()
+    match = re.search(r"\b(?:factuur(?:nummer|nr)?|invoice)\s*[-_ #.:]*"
+                      r"([A-Za-z0-9][A-Za-z0-9._/-]{2,47})\b", base, re.I)
+    if not match and _inv_email_utils.parseaddr(str(sender or ""))[1].lower().endswith("@pay.nl"):
+        # Pay vermeldt het PAYNL-kenmerk vooraan in de bijlagenaam. Alleen
+        # als voorstel tonen; dit mag nooit automatische verzending starten.
+        match = re.match(r"(PAYNL-\d{6,47})\b", base, re.I)
+    if match and re.search(r"\d", match.group(1)):
+        suggestion["number"] = _inv_name_part(match.group(1), 48)
+        suggestion["number_basis"] = "bestandsnaam"
+        suggestion["complete"] = False
+        suggestion["filename"] = ""
+        suggestion["missing"] = [key for key in ("year", "company", "number") if not suggestion[key]]
+    return suggestion
 
 
 def _inv_final_filename(text: str, sender: str, supplied=None):
@@ -9665,27 +9688,30 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
                             fresh_analysis.append((analysis_key, kind, reason, source))
                         kind, reason, source = analysis[analysis_key]
                         name = None
-                        if kind == "invoice":
-                            name = names.get(digest)
-                            if name is None:
+                        if kind in {"invoice", "review"}:
+                            name_key = _inv_analysis_key(digest, filename) + ":n2"
+                            name = names.get(name_key)
+                            if not isinstance(name, dict) or name.get("extractor_version") != 2:
                                 if text is None:
                                     text, source = _inv_pdf_text(pdf)
-                                name = _inv_name_suggestion(text, sender)
+                                name = _inv_name_with_filename(text, sender, filename)
                                 name["basis"] = source
+                                name["extractor_version"] = 2
                                 if source != "PDF-tekst":
                                     name["complete"] = False
-                                names[digest] = name
-                                fresh_names.append((digest, name))
+                                names[name_key] = name
+                                fresh_names.append((name_key, name))
                         amount = None
                         if kind in {"invoice", "review"}:
-                            if digest not in amounts:
+                            amount_key = digest + ":amount-v2"
+                            if amount_key not in amounts:
                                 if text is None:
                                     text, _ = _inv_pdf_text(pdf)
-                                amounts[digest] = _inv_total_amount(text)
-                                fresh_amounts.append((digest, amounts[digest]))
-                            amount = amounts[digest]
+                                amounts[amount_key] = _inv_total_amount(text)
+                                fresh_amounts.append((amount_key, amounts[amount_key]))
+                            amount = amounts[amount_key]
                         visible_name = _inv_known_supplier(name, sender, suppliers) if name else None
-                        if visible_name and source != "PDF-tekst":
+                        if visible_name and (source != "PDF-tekst" or kind != "invoice"):
                             visible_name["complete"] = False
                         docs.append({"mailbox": address, "uid": uid, "digest": digest,
                                      "sender": sender, "received": received,
@@ -9790,11 +9816,11 @@ def invoice_imap_pdf(payload: dict, request: Request):
 @app.post("/api/invoice-imap/name")
 def invoice_imap_name(payload: dict, request: Request):
     _inv_authorize(request)
-    original, _, pdf = _inv_resend_document(str(payload.get("mailbox", "")),
+    original, filename, pdf = _inv_resend_document(str(payload.get("mailbox", "")),
         str(payload.get("uid", "")), str(payload.get("digest", ""))) if payload.get("previously_sent") is True else _inv_document(
         str(payload.get("mailbox", "")), str(payload.get("uid", "")), str(payload.get("digest", "")))
     text, source = _inv_pdf_text(pdf)
-    suggestion = _inv_known_supplier(_inv_name_suggestion(text, str(original.get("From", ""))),
+    suggestion = _inv_known_supplier(_inv_name_with_filename(text, str(original.get("From", "")), filename),
                                      str(original.get("From", "")), _inv_supplier_directory())
     suggestion["basis"] = source
     if source != "PDF-tekst":
