@@ -9194,65 +9194,63 @@ def _inv_attachments(message):
 
 
 def _inv_pdf_text(pdf: bytes) -> tuple[str, str]:
-    """Lees de werkelijke PDF-inhoud; OCR blijft afzonderlijk herkenbaar."""
-    extracted, source = "", "onleesbaar"
+    """Lees iedere pagina; gebruik OCR voor pagina's met weinig tekst."""
+    pages = []
+    source = "onleesbaar"
     try:
         reader = _InvPdfReader(_inv_io.BytesIO(pdf), strict=False)
         if reader.is_encrypted:
             return "", "versleuteld"
-        pages = []
-        for page in reader.pages[:4]:
+        for page in reader.pages:
+            text = ""
             try:
-                # Sla buitenproportioneel grote streams over vóór tekstparsing.
                 content = page.get_contents()
-                if content and len(content.get_data()) > 8_000_000:
-                    continue
-                plain = page.extract_text() or ""
-                try:
-                    layout = page.extract_text(extraction_mode="layout") or ""
-                except Exception:
-                    layout = ""
-                pages.append(layout if len(layout.strip()) >= len(plain.strip()) * .75 else plain)
+                if not content or len(content.get_data()) <= 8_000_000:
+                    plain = page.extract_text() or ""
+                    try:
+                        layout = page.extract_text(extraction_mode="layout") or ""
+                    except Exception:
+                        layout = ""
+                    text = plain
+                    if layout.strip() and layout.strip() != plain.strip():
+                        text += "\n" + layout
             except Exception:
-                continue
-        extracted = "\n".join(pages)[:25000]
-        if extracted.strip():
-            source = "PDF-tekst"
+                pass
+            pages.append(text)
     except Exception:
         pass
-    if len(extracted.strip()) >= 300:
-        return extracted, source
     try:
         import fitz
         with fitz.open(stream=pdf, filetype="pdf") as document:
-            candidate = "\n".join(page.get_text("text", sort=True) for page in list(document)[:4])[:25000]
-            if len(candidate.strip()) > len(extracted.strip()):
-                extracted, source = candidate, "PDF-tekst"
-            if len(extracted.strip()) >= 300:
-                return extracted, source
-            # OCR alleen voor een beeld-PDF met onvoldoende uitleesbare tekst.
-            ocr = []
-            for page in list(document)[:2]:
+            if document.needs_pass:
+                return "", "versleuteld"
+            for index, page in enumerate(document):
+                while len(pages) <= index:
+                    pages.append("")
+                candidate = page.get_text("text", sort=True) or ""
+                if len(candidate.strip()) > len(pages[index].strip()):
+                    pages[index] = candidate
+                if len(pages[index].strip()) >= 300 or not page.get_images(full=False):
+                    continue
                 if page.rect.width * page.rect.height > 2_000_000:
-                    break
-                if not page.get_images(full=False):
                     continue
                 image = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).tobytes("png")
-                result = None
                 for language in ("nld+eng", "eng"):
                     try:
                         result = _inv_subprocess.run(["tesseract", "stdin", "stdout", "-l", language],
-                                                     input=image, capture_output=True, timeout=20, check=True)
+                            input=image, capture_output=True, timeout=20, check=True)
+                        recognized = result.stdout.decode("utf-8", "replace")
+                        if len(recognized.strip()) > len(pages[index].strip()):
+                            pages[index] = recognized
+                            source = "OCR-scan"
                         break
-                    except (_inv_subprocess.CalledProcessError, FileNotFoundError):
+                    except (_inv_subprocess.CalledProcessError, _inv_subprocess.TimeoutExpired, FileNotFoundError):
                         continue
-                if result:
-                    ocr.append(result.stdout.decode("utf-8", "replace"))
-            recognized = "\n".join(ocr)[:25000]
-            if len(recognized.strip()) > len(extracted.strip()):
-                return recognized, "OCR-scan"
     except Exception:
         pass
+    extracted = "\n".join(pages)
+    if extracted.strip() and source != "OCR-scan":
+        source = "PDF-tekst"
     return extracted, source
 
 
@@ -9262,24 +9260,36 @@ def _inv_classify(text: str):
     if not lines:
         return "unreadable", "Geen leesbare tekst in PDF; controleer deze handmatig."
     header = " ".join(lines[:16])[:1000]
-    normalized = " ".join(lines)[:25000]
+    normalized = " ".join(lines)
     other = re.compile(r"\b(?:proforma|orderbevestiging|opdrachtbevestiging|quotation|offerte|pakbon|delivery note|tekening|leveringsvoorwaarden)\b")
     invoice = re.compile(r"\b(?:factuur|invoice|creditnota|credit note)\b")
     # Koptekst is leidend: 'factuuradres' of 'factuurvoorwaarden' op een offerte
     # mag nooit voldoende zijn om de offerte als factuur aan te merken.
     header_title = bool(re.search(r"\b(?:factuur|invoice|creditnota|credit note)\b",header))
-    negative = bool(other.search(header))
-    if negative and invoice.search(" ".join(lines[:3])):
-        return "review", "Factuur verwijst ook naar een offerte of order; controleer de PDF."
+    # Alleen een documenttitel maakt dit een offerte/order. Een verwijzing
+    # zoals 'uw offerte 123' op een echte factuur is geen uitsluitingsgrond.
+    other_title = next((i for i, line in enumerate(lines[:30]) if re.fullmatch(
+        r"(?:offerte|quotation|orderbevestiging|opdrachtbevestiging|pakbon|delivery note|"
+        r"tekening|leveringsvoorwaarden|pro\s*forma(?:\s+factuur)?)"
+        r"(?:\s*[:#-]?\s*[a-z]*[-/]?\d[\w/-]*)?", line)), None)
+    invoice_title = next((i for i, line in enumerate(lines[:30]) if re.fullmatch(
+        r"(?:factuur|invoice|creditnota|credit note)(?:\s*[:#-]?\s*[a-z0-9/-]*\d[a-z0-9/-]*)?",
+        line)), None)
+    negative = other_title is not None and (invoice_title is None or other_title < invoice_title)
     if negative:
-        return "other", "Koptekst geeft een offerte, order of ander document aan."
+        return "other", "Documenttitel geeft een offerte, order of ander document aan."
     if not header_title and not invoice.search(normalized[:1600]):
         return "other", "Geen factuurkop in de PDF gevonden."
-    title = header_title and not re.search(r"\b(?:factuuradres|factuurgegevens|factuurvoorwaarden|invoice address)\b",header[:150])
-    number = bool(re.search(r"\b(?:factuur(?:nummer|nr\.?|\s*nummer|\s*nr\.?)?|invoice\s*(?:no\.?|number|#)|creditnota\s*(?:nr\.?|nummer)?)\s*[:#-]?\s*(?=[a-z0-9/-]*\d)[a-z0-9][a-z0-9/-]{3,}\b", normalized[:2400]))
+    title = header_title or any(re.fullmatch(r"(?:factuur|invoice|creditnota|credit note)(?:\s*[:#-]?\s*[a-z0-9/-]*\d[a-z0-9/-]*)?", line) for line in lines)
+    number = bool(re.search(r"\b(?:factuur(?:nummer|nr\.?|\s*nummer|\s*nr\.?)?|invoice\s*(?:no\.?|number|#)|creditnota\s*(?:nr\.?|nummer)?)\s*[:#-]?\s*(?=[a-z0-9/-]*\d)[a-z0-9][a-z0-9/-]{3,}\b", normalized))
     total = bool(re.search(r"\b(?:totaal(?:\s*(?:te\s*betalen|incl(?:usief)?\.?\s*btw|bedrag))?|amount\s*due|total\s*(?:amount|due)?|te\s*betalen|grand\s*total)\s*[:€\s]{0,20}(?:eur\s*)?\d[\d.,]*", normalized))
     issuer = bool(re.search(r"\b(?:btw(?:-?nummer)?|vat\s*(?:id|number|no)|iban|kvk)\b", normalized))
-    if title and number and total and issuer:
+    extracted_fields = _inv_name_suggestion(text, "")
+    number = number or bool(extracted_fields["number"])
+    total = total or _inv_total_amount(text) is not None
+    dated_invoice = bool(extracted_fields["year"] and re.search(
+        r"\b(?:factuurdatum|invoice\s*date|datum\s*factuur)\b", normalized))
+    if title and number and issuer and (total or dated_invoice):
         return "invoice", "Factuurkop, nummer, totaal en afzendergegevens gevonden."
     if title or number:
         return "review", "Mogelijke factuur; controleer nummer, totaal en leverancier in de PDF."
@@ -9296,7 +9306,7 @@ def _inv_kind(text: str, filename: str, source: str = "PDF-tekst"):
         return "other", "Bestandsnaam duidt op een ander document."
     kind, reason = _inv_classify(text)
     if source == "OCR-scan" and kind == "invoice":
-        return "review", "Scan lijkt een factuur; controleer het origineel vanwege mogelijke OCR-fouten."
+        return "invoice", "Factuurgegevens herkend met OCR; controleer de voorgestelde naam vóór verzending."
     return kind, reason
 
 
@@ -9350,7 +9360,7 @@ def _inv_name_part(value: str, maximum: int = 64) -> str:
 def _inv_name_suggestion(text: str, sender: str):
     """Gebruik alleen aantoonbare PDF-gegevens; maildomeinen zijn geen leverancier."""
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
-    opening = "\n".join(lines[:45])[:4500]
+    opening = "\n".join(lines)
     year = ""
     date = re.search(r"\b(?:factuurdatum|invoice\s*date|date\s*of\s*issue|datum\s*factuur)\b"
                      r"[^\n\d]{0,28}(?:\d{1,2}[./-]\d{1,2}[./-](20\d{2})|"
@@ -9359,7 +9369,7 @@ def _inv_name_suggestion(text: str, sender: str):
     if date:
         year = next((part for part in date.groups() if part), "")
     if not year:
-        for position, line in enumerate(lines[:30]):
+        for position, line in enumerate(lines):
             if not re.search(r"\b(?:factuurdatum|invoice\s*date|date\s*of\s*issue|datum)\b", line, re.I):
                 continue
             nearby = line + " " + (lines[position+1] if position+1 < len(lines) else "")
@@ -9370,10 +9380,10 @@ def _inv_name_suggestion(text: str, sender: str):
                 break
     number = ""
     number_label = re.compile(r"\b(?:factuur\s*(?:nummer|nr\.?|no\.?)|factuurnr\.?|"
-                              r"invoice\s*(?:number|no\.?|#)|creditnota\s*(?:nummer|nr\.?))"
+                              r"invoice\s*(?:number|no\.?|#)|creditnota\s*(?:nummer|nr\.?)|factuur(?=\s*[:#.-]?\s*\d))"
                               r"\s*[:#.-]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{1,45})", re.I)
     number_only = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{1,47}")
-    for position, line in enumerate(lines[:55]):
+    for position, line in enumerate(lines):
         match = number_label.search(line)
         if match and re.search(r"\d", match.group(1)):
             number = _inv_name_part(match.group(1), 48)
@@ -9390,18 +9400,18 @@ def _inv_name_suggestion(text: str, sender: str):
             if number:
                 break
     header_company = ""
-    for line in lines[:12]:
+    for line in lines:
         company = re.match(r"^(.{2,65}?)\s+(?:B\.?V\.?|GmbH|Ltda?|Inc\.?|N\.?V\.?)\b", line, re.I)
         if company and not re.search(r"\b(?:vakstaal|factuur|invoice|klant|aan:|ship\s+to)\b", company.group(1), re.I):
             header_company = _inv_name_part(company.group(1), 55).lower()
             break
     if not header_company:
-        for position, line in enumerate(lines[:24]):
+        for position, line in enumerate(lines):
             labelled = re.match(r"^(?:leverancier|afzender|supplier|seller|from)\s*:?\s*(.{2,65})$", line, re.I)
             candidate = labelled.group(1) if labelled else (lines[position+1] if re.fullmatch(
                 r"(?:leverancier|afzender|supplier|seller|from)\s*:?", line, re.I)
                 and position+1 < len(lines) else "")
-            if candidate and not re.search(r"\b(?:vakstaal|factuur|invoice|pay|betaling|klant)\b", candidate, re.I):
+            if candidate and not re.search(r"\b(?:vakstaal|factuur|invoice|betaling|klant)\b", candidate, re.I):
                 header_company = _inv_name_part(candidate, 55).lower()
                 break
     company = _inv_name_part(header_company, 55).lower()
@@ -9679,7 +9689,7 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
                             continue
                         # Toon ook een tweede mailkopie uit het andere postvak.
                         # De verzendregistratie blijft per PDF-digest uniek.
-                        analysis_key = _inv_analysis_key(digest, filename)
+                        analysis_key = _inv_analysis_key(digest, filename) + ":class-v3"
                         text = None
                         if analysis_key not in analysis:
                             text, source = _inv_pdf_text(pdf)
@@ -9689,14 +9699,14 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
                         kind, reason, source = analysis[analysis_key]
                         name = None
                         if kind in {"invoice", "review"}:
-                            name_key = _inv_analysis_key(digest, filename) + ":n2"
+                            name_key = _inv_analysis_key(digest, filename) + ":n3"
                             name = names.get(name_key)
-                            if not isinstance(name, dict) or name.get("extractor_version") != 2:
+                            if not isinstance(name, dict) or name.get("extractor_version") != 3:
                                 if text is None:
                                     text, source = _inv_pdf_text(pdf)
                                 name = _inv_name_with_filename(text, sender, filename)
                                 name["basis"] = source
-                                name["extractor_version"] = 2
+                                name["extractor_version"] = 3
                                 if source != "PDF-tekst":
                                     name["complete"] = False
                                 names[name_key] = name
