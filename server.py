@@ -8745,6 +8745,246 @@ async def dropbox_library_sources_scan(request: Request):
             'truncated':len(files)>1000, 'applied':False}
 
 
+# TransIP inkoopfacturen: secrets blijven uitsluitend op de server.
+import imaplib as _inv_imaplib
+import email as _inv_email
+import email.utils as _inv_email_utils
+import hashlib as _inv_hashlib
+import hmac as _inv_hmac
+import io as _inv_io
+import subprocess as _inv_subprocess
+from datetime import timedelta as _inv_timedelta
+from email import policy as _inv_policy
+from email.utils import parsedate_to_datetime as _inv_parsedate
+try:
+    from pypdf import PdfReader as _InvPdfReader
+except ImportError:
+    _InvPdfReader = None
+
+_INV_ADDRESSES = {
+    "administratie@vakstaal.nl": "VAKSTAAL_IMAP_ADMINISTRATIE_PASSWORD",
+    "info@vakstaal.nl": "VAKSTAAL_IMAP_INFO_PASSWORD",
+}
+_INV_MAX_PDF = 5_000_000
+
+
+def _inv_authorize(request: Request):
+    secret = os.environ.get("VAKSTAAL_INVOICE_API_KEY", "")
+    supplied = request.headers.get("X-Invoice-Key", "")
+    if not secret or not supplied or not _inv_hmac.compare_digest(supplied, secret):
+        raise HTTPException(403, "Factuurkoppeling is niet ingesteld of toegang geweigerd.")
+
+
+def _inv_mailbox(address: str):
+    env = _INV_ADDRESSES.get(address)
+    if not env:
+        raise HTTPException(400, "Ongeldig postvak.")
+    password = os.environ.get(env, "")
+    if not password:
+        raise HTTPException(503, f"Postvak {address} is nog niet ingesteld op de server.")
+    try:
+        imap = _inv_imaplib.IMAP4_SSL("imap.transip.email", 993, timeout=25)
+        imap.login(address, password)
+        result, _ = imap.select("INBOX", readonly=True)
+        if result != "OK":
+            raise ValueError("Postvak IN is niet beschikbaar")
+        return imap
+    except Exception as exc:
+        raise HTTPException(502, f"Verbinding met {address} mislukt; controleer de serverinstellingen.") from exc
+
+
+def _inv_attachments(message):
+    for part in message.walk():
+        name = part.get_filename() or ""
+        if not name.lower().endswith(".pdf"):
+            continue
+        data = part.get_payload(decode=True)
+        if data and len(data) <= _INV_MAX_PDF and data.startswith(b"%PDF-"):
+            yield name, data
+
+
+def _inv_pdf_text(pdf: bytes) -> str:
+    if _InvPdfReader is None:
+        return ""
+    try:
+        reader = _InvPdfReader(_inv_io.BytesIO(pdf), strict=False)
+        if reader.is_encrypted:
+            return ""
+        extracted = "\n".join((page.extract_text() or "") for page in reader.pages[:4])[:25000]
+        if len(extracted.strip()) >= 40:
+            return extracted
+        # Gescande PDF: OCR alleen als zowel PyMuPDF als Tesseract beschikbaar zijn.
+        try:
+            import fitz
+            document = fitz.open(stream=pdf, filetype="pdf")
+            ocr = []
+            for page in list(document)[:2]:
+                if page.rect.width * page.rect.height > 2_000_000:
+                    return extracted
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                image = pixmap.tobytes("png")
+                try:
+                    result = _inv_subprocess.run(
+                        ["tesseract", "stdin", "stdout", "-l", "nld+eng"],
+                        input=image, capture_output=True, timeout=20, check=True)
+                except _inv_subprocess.CalledProcessError:
+                    result = _inv_subprocess.run(
+                        ["tesseract", "stdin", "stdout", "-l", "eng"],
+                        input=image, capture_output=True, timeout=20, check=True)
+                ocr.append(result.stdout.decode("utf-8", "replace"))
+            return extracted + "\n" + "\n".join(ocr)
+        except Exception:
+            return extracted
+    except Exception:
+        return ""
+
+
+def _inv_classify(text: str):
+    normalized = re.sub(r"\s+", " ", text).lower()
+    if not normalized.strip():
+        return "unreadable", "Geen leesbare tekst in PDF; controleer deze handmatig."
+    document_head = normalized[:1300]
+    if re.search(r"\b(proforma|orderbevestiging|opdrachtbevestiging|quotation|offerte|pakbon|delivery note|tekening)\b", document_head):
+        if not re.search(r"\b(factuur|invoice|creditnota|credit note)\b", document_head[:350]):
+            return "other", "Ander documenttype herkend."
+        return "review", "PDF bevat ook een ander documenttype; controleer deze."
+    title = bool(re.search(r"\b(factuur|invoice|creditnota|credit note)\b", document_head[:600]))
+    number = bool(re.search(r"\b(?:factuur|invoice|credit(?:nota| note))\s*(?:nr\.?|nummer|number|no\.?|#|:)?\s*[:#-]?\s*[a-z0-9][a-z0-9/-]{3,}\b", document_head))
+    total = bool(re.search(r"(?:totaal\s*(?:(?:te\s*betalen|incl(?:usief)?\.?\s*btw|bedrag))?|amount\s*due|total\s*(?:amount|due)?|te\s*betalen)\s*[:€\s]{0,20}(?:eur\s*)?\d[\d.,]*", normalized))
+    issuer = bool(re.search(r"\b(?:btw(?:-?nummer)?|vat\s*(?:id|number|no)|iban|kvk)\b", normalized))
+    if title and number and total and issuer:
+        return "invoice", "Factuurkop, nummer, totaal en afzendergegevens gevonden."
+    if title:
+        return "review", "Lijkt een factuur, maar niet alle kenmerken zijn gevonden."
+    return "other", "Geen factuurkenmerken in de PDF gevonden."
+
+
+def _inv_fetch(imap, uid: str):
+    if not uid.isascii() or not uid.isdigit() or len(uid)>20:
+        raise HTTPException(400, "Ongeldige mailreferentie.")
+    result, data = imap.uid("FETCH", uid, "(RFC822)")
+    if result != "OK" or not data or not any(isinstance(item, tuple) for item in data):
+        raise HTTPException(404, "Mail is niet meer beschikbaar.")
+    raw = next(item[1] for item in data if isinstance(item, tuple))
+    if len(raw) > 12_000_000:
+        raise HTTPException(413, "Mail is te groot.")
+    return _inv_email.message_from_bytes(raw, policy=_inv_policy.default)
+
+
+def _inv_document(address: str, uid: str, digest: str):
+    if not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise HTTPException(400, "Ongeldige bijlagereferentie.")
+    imap = _inv_mailbox(address)
+    try:
+        msg = _inv_fetch(imap, uid)
+        for name, pdf in _inv_attachments(msg):
+            if _inv_hmac.compare_digest(_inv_hashlib.sha256(pdf).hexdigest(), digest):
+                return msg, name, pdf
+        raise HTTPException(404, "PDF is verwijderd of gewijzigd.")
+    finally:
+        try: imap.logout()
+        except Exception: pass
+
+
+@app.get("/api/invoice-imap/status")
+def invoice_imap_status(request: Request):
+    _inv_authorize(request)
+    return {"accounts": [{"address": address, "configured": bool(os.environ.get(env))}
+                          for address, env in _INV_ADDRESSES.items()], "pdf_reader": _InvPdfReader is not None}
+
+
+@app.get("/api/invoice-imap/scan")
+def invoice_imap_scan(request: Request):
+    _inv_authorize(request)
+    if _InvPdfReader is None:
+        raise HTTPException(503, "PDF-herkenning ontbreekt op de server: installeer pypdf.")
+    since = (datetime.now(timezone.utc)-_inv_timedelta(days=30)).strftime("%d-%b-%Y")
+    docs, errors, seen_pdfs = [], [], set()
+    for address in _INV_ADDRESSES:
+        try:
+            imap = _inv_mailbox(address)
+            try:
+                result, found = imap.uid("SEARCH", None, "SINCE", since)
+                if result != "OK": raise ValueError("Zoeken mislukt")
+                for uidbytes in reversed((found[0] or b"").split()[-120:]):
+                    uid = uidbytes.decode("ascii")
+                    try: msg = _inv_fetch(imap, uid)
+                    except HTTPException: continue
+                    sender = _inv_email_utils.parseaddr(str(msg.get("From", "")))[1].lower()
+                    received = str(msg.get("Date", ""))
+                    try: received = _inv_parsedate(received).astimezone(timezone.utc).isoformat()
+                    except Exception: received = ""
+                    for filename, pdf in _inv_attachments(msg):
+                        digest = _inv_hashlib.sha256(pdf).hexdigest()
+                        if digest in seen_pdfs:
+                            continue  # Zelfde factuur in beide postvakken slechts één keer tonen.
+                        seen_pdfs.add(digest)
+                        kind, reason = _inv_classify(_inv_pdf_text(pdf))
+                        docs.append({"mailbox": address, "uid": uid, "digest": digest,
+                                     "sender": sender, "received": received,
+                                     "subject": str(msg.get("Subject", ""))[:200],
+                                     "filename": filename[:200], "size": len(pdf),
+                                     "classification": kind, "reason": reason})
+            finally:
+                try: imap.logout()
+                except Exception: pass
+        except Exception:
+            errors.append(f"{address}: postvak niet ingesteld of niet bereikbaar")
+    return {"documents": docs, "errors": errors}
+
+
+@app.post("/api/invoice-imap/pdf")
+def invoice_imap_pdf(payload: dict, request: Request):
+    _inv_authorize(request)
+    _, name, pdf = _inv_document(str(payload.get("mailbox", "")), str(payload.get("uid", "")), str(payload.get("digest", "")))
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": "inline; filename=invoice.pdf", "Cache-Control": "no-store"})
+
+
+@app.post("/api/invoice-imap/send")
+def invoice_imap_send(payload: dict, request: Request):
+    _inv_authorize(request)
+    destination = str(payload.get("destination", "")).strip()
+    if not re.fullmatch(r"[^@\s]+@e-boekhouden\.nl", destination, re.I):
+        raise HTTPException(400, "Ongeldig e-Boekhouden-adres.")
+    original, filename, pdf = _inv_document(str(payload.get("mailbox", "")),str(payload.get("uid", "")),str(payload.get("digest", "")))
+    kind, _ = _inv_classify(_inv_pdf_text(pdf))
+    if kind != "invoice":
+        raise HTTPException(409, "Alleen als factuur herkende PDF's mogen worden doorgestuurd.")
+    cfg = _quote_mail_smtp_settings()
+    if not cfg.get("host") or not cfg.get("user") or not cfg.get("password"):
+        raise HTTPException(503, "SMTP-verzending is niet ingesteld op de server.")
+    # Reserveer vóór het verzenden: bij een timeout kan SMTP al afgeleverd hebben.
+    reference = str(payload.get("digest"))  # Ook over beide postvakken heen idempotent.
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_delivery (reference TEXT PRIMARY KEY, created_at TEXT NOT NULL)")
+        marker = "%s" if _postgres_enabled() else "?"
+        result = conn.execute(f"INSERT INTO invoice_mail_delivery (reference, created_at) VALUES ({marker}, {marker}) ON CONFLICT (reference) DO NOTHING",
+                              (reference, datetime.now(timezone.utc).isoformat()))
+        if result.rowcount == 0:
+            raise HTTPException(409, "Deze PDF is al verzonden of de ontvangst moet nog worden gecontroleerd.")
+    mail = EmailMessage()
+    mail["From"] = cfg.get("from") or cfg["user"]
+    mail["To"] = destination
+    mail["Subject"] = "Inkoopfactuur: " + str(original.get("Subject", ""))[:120].replace("\n", " ").replace("\r", " ")
+    mail.set_content("Afzender: " + _inv_email_utils.parseaddr(str(original.get("From", "")))[1] + "\nBronpostvak: " + str(payload.get("mailbox", "")))
+    mail.add_attachment(pdf, maintype="application", subtype="pdf", filename=os.path.basename(filename))
+    try:
+        context = ssl.create_default_context()
+        if cfg.get("ssl"):
+            with smtplib.SMTP_SSL(cfg["host"], int(cfg["port"]), timeout=25, context=context) as smtp:
+                smtp.login(cfg["user"], cfg["password"])
+                smtp.send_message(mail)
+        else:
+            with smtplib.SMTP(cfg["host"], int(cfg["port"]), timeout=25) as smtp:
+                smtp.starttls(context=context)
+                smtp.login(cfg["user"], cfg["password"])
+                smtp.send_message(mail)
+    except Exception as exc:
+        raise HTTPException(502, "SMTP-verzending mislukt; controleer eerst of de mail toch is aangekomen.") from exc
+    return {"sent": True}
+
+
 from vakstaal_auth import install_auth
 
 install_auth(app, _db_connect, _postgres_enabled)
@@ -8754,7 +8994,7 @@ app.add_middleware(
     allow_origins=[os.getenv("VAKSTAAL_APP_ORIGIN", "https://vakstaal-calculator.vercel.app").rstrip("/")],
     allow_credentials=False,
     allow_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Invoice-Key"],
     expose_headers=["Content-Disposition", "Retry-After"],
 )
 
