@@ -44,6 +44,8 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))
 TTL_HOURS = int(os.environ.get("STEP_TTL_HOURS", "6"))
 
 STEP_MATERIAL_LENGTH_VERSION = 8  # full body projection along longitudinal profile axis
+LCM_TIMING_SCHEMA = 2  # v139: named TimeStay only; no controller delays in pierce time
+
 STEP_PROFILE_RECOGNITION_VERSION = 13  # v771: topology-based outer skin + tabs/end contours
 # v966: LCM writer ondersteunt Corner Speed (%) naast Define corner/B-as parameters.
 
@@ -2950,7 +2952,7 @@ def get_app_state():
         return {
             "ok": True,
             "exists": True,
-            "state": state,
+            "state": _lcm_refresh_state_timing(state),
             "updated_at": updated_at,
         }
 
@@ -2969,6 +2971,7 @@ def put_app_state(payload: dict):
     }
 
     now = _utcnow()
+    state = _lcm_refresh_state_timing(state)
     raw = json.dumps(state, ensure_ascii=False)
 
     with _db_connect() as conn:
@@ -3389,38 +3392,18 @@ def _lcm_cut_parameters_complete(data: bytes,cut_block: dict) -> dict:
         "dutyCyclePct":(float(ratio)*100.0 if isinstance(ratio,(int,float)) and abs(float(ratio))<=1.5 else ratio),
         "frequencyHz":frequency,
         "beamSizeMm":cut_block.get("BeamSize"),
-        # Echte timing uit het Cut-blok. CycleTime is NIET hetzelfde als piercen;
-        # de machine-LCM bevat daarnaast eigen focus/blow/follow/stay tijden.
-        "cycleTimeMs":(
-            cut_block.get("CycleTime")
-            if cut_block.get("CycleTime") is not None
-            else _lcm_decode_cut_field_by_id(data,0x23)
-        ),
-        "pierceTimeMs":(
-            cut_block.get("CycleTime")
-            if cut_block.get("CycleTime") is not None
-            else _lcm_decode_cut_field_by_id(data,0x23)
-        ),  # legacy compatibiliteit
-        "timeFocusMs":(
-            cut_block.get("TimeFocus")
-            if cut_block.get("TimeFocus") is not None
-            else _lcm_decode_cut_field_by_id(data,0x16)
-        ),
-        "timeBlowMs":(
-            cut_block.get("TimeBlow")
-            if cut_block.get("TimeBlow") is not None
-            else _lcm_decode_cut_field_by_id(data,0x17)
-        ),
-        "timeFollowMs":(
-            cut_block.get("TimeFollow")
-            if cut_block.get("TimeFollow") is not None
-            else _lcm_decode_cut_field_by_id(data,0x1E)
-        ),
-        "timeStayMs":(
-            cut_block.get("TimeStay")
-            if cut_block.get("TimeStay") is not None
-            else _lcm_decode_cut_field_by_id(data,0x26)
-        ),
+        # v139: ieder bestand gebruikt zijn eigen veldnaam-/referentietabel.
+        # Het zichtbare onderste Pierce time-veld is TimeStay, ook in Cut.
+        # CycleTime/FreqEnd/Focus/Blow/Follow zijn GEEN vervangende piercetijden.
+        # Bewaar overige velden alleen voor inspectie, niet als extra procestijd.
+        "cycleTimeMs":cut_block.get("CycleTime"),
+        "pierceTimeMs":cut_block.get("TimeStay"),
+        "pierceTimeField":"TimeStay",
+        "timingSchema":LCM_TIMING_SCHEMA,
+        "timeFocusMs":cut_block.get("TimeFocus"),
+        "timeBlowMs":cut_block.get("TimeBlow"),
+        "timeFollowMs":cut_block.get("TimeFollow"),
+        "timeStayMs":cut_block.get("TimeStay"),
         "laserOffDelayMs":_lcm_named_ref_value(data,b"DelayBeforeLaserOff"),
         "useLowPassFilter":_lcm_named_flag(data,b"UseLowPassFilter"),
         "lowPassFrequencyHz":_lcm_read_named_number(data,b"LowPassFrequency"),
@@ -3450,8 +3433,13 @@ def _lcm_pierce_parameters_complete(data: bytes) -> dict:
             "beamSize":block.get("BeamSize"),
             "focusMm":block.get("Focus"),
             "endFocusMm":block.get("FocusEnd"),
-            "pierceTimeMs":block.get("FreqEnd"),
-            "laserOffGasOnMs":block.get("CycleTime"),
+            # Alleen het onderste instelbare Pierce time-veld; geen FreqEnd (Hz).
+            "pierceTimeMs":block.get("TimeStay"),
+            "pierceTimeField":"TimeStay",
+            "timingSchema":LCM_TIMING_SCHEMA,
+            "timeStayMs":block.get("TimeStay"),
+            # Alleen zichtbaar als bronveld. Niet meetellen in tijd/gascalculatie.
+            "laserOffGasOnMs":block.get("TimeBlow"),
         }
     return {"type":ptype,**stages}
 
@@ -3631,7 +3619,7 @@ def _parse_fs_material_lcm(content: bytes, filename: str = "") -> dict:
         pressure=_lcm_decode_cut_field_by_id(data,0x1B)
 
     return {
-        "ok":True,"filename":filename,"note":note,"material":material,
+        "ok":True,"lcmTimingSchema":LCM_TIMING_SCHEMA,"filename":filename,"note":note,"material":material,
         "thicknessMm":thickness,"profile":profile,"radiusMm":radius_mm,
         "gas":gas,"nozzle":nozzle,"gasPressureBar":pressure,
         "cutSpeedMMin":speed_m_min,"workSpeedMmS":work_speed_mm_s,
@@ -3643,6 +3631,53 @@ def _parse_fs_material_lcm(content: bytes, filename: str = "") -> dict:
         "originalFilename":filename,
     }
 
+
+
+def _lcm_refresh_state_timing(state: dict) -> dict:
+    """Refresh old parsed timing from each layer's OWN embedded LCM.
+
+    A new Dropbox revision is not required to correct an earlier parser bug.
+    Only parsed timing metadata changes; the source binary, profile, price,
+    gas settings and all quote snapshots are left untouched.
+    """
+    settings_obj=state.get("settings") if isinstance(state,dict) else None
+    layers=settings_obj.get("cutLayerPresets") if isinstance(settings_obj,dict) else None
+    if not isinstance(layers,list):
+        return state
+    parsed_cache={}
+    for layer in layers:
+        if not isinstance(layer,dict) or not layer.get("contentBase64"):
+            continue
+        cut=layer.get("cutParameters") or {}
+        pp=layer.get("pierceParameters") or {}
+        if (cut.get("timingSchema")==LCM_TIMING_SCHEMA and
+            all((pp.get(f"stage{i}") or {}).get("timingSchema")==LCM_TIMING_SCHEMA for i in (1,2,3))):
+            continue
+        raw=str(layer["contentBase64"])
+        try:
+            if len(raw)>14*1024*1024:
+                raise ValueError("LCM te groot voor herinlezen.")
+            if raw not in parsed_cache:
+                content=base64.b64decode(raw,validate=True)
+                parsed_cache[raw]=_parse_fs_material_lcm(content,str(layer.get("originalFilename") or "layer.lcm"))
+            parsed=parsed_cache[raw]
+            target=layer.setdefault("cutParameters",{})
+            for key in ("pierceTimeMs","pierceTimeField","timingSchema","timeStayMs",
+                        "timeFocusMs","timeBlowMs","timeFollowMs","cycleTimeMs","laserOffDelayMs"):
+                target[key]=parsed["cutParameters"].get(key)
+            target_pp=layer.setdefault("pierceParameters",{})
+            target_pp["type"]=parsed["pierceParameters"]["type"]
+            for i in (1,2,3):
+                stage=target_pp.setdefault(f"stage{i}",{})
+                source=parsed["pierceParameters"][f"stage{i}"]
+                for key in ("pierceTimeMs","pierceTimeField","timingSchema","timeStayMs","timeMs","laserOffGasOnMs"):
+                    stage[key]=source.get(key)
+            layer["lcmTimingSchema"]=LCM_TIMING_SCHEMA
+            layer.pop("lcmTimingReadError",None)
+        except Exception as exc:
+            # Never pretend that an old FreqEnd/CycleTime mapping is verified.
+            layer["lcmTimingReadError"]=f"LCM-piercetijd niet herlezen: {type(exc).__name__}"
+    return state
 
 
 def _lcm_unpack_payload(content: bytes) -> tuple[bytes, bytes, bytes]:
@@ -8775,7 +8810,7 @@ def _inv_authorize(request: Request):
         raise HTTPException(403, "Factuurkoppeling is niet ingesteld of toegang geweigerd.")
 
 
-def _inv_mailbox(address: str):
+def _inv_mailbox(address: str, *, writable: bool = False):
     env = _INV_ADDRESSES.get(address)
     if not env:
         raise HTTPException(400, "Ongeldig postvak.")
@@ -8785,7 +8820,7 @@ def _inv_mailbox(address: str):
     try:
         imap = _inv_imaplib.IMAP4_SSL("imap.transip.email", 993, timeout=25)
         imap.login(address, password)
-        result, _ = imap.select("INBOX", readonly=True)
+        result, _ = imap.select("INBOX", readonly=not writable)
         if result != "OK":
             raise ValueError("Postvak IN is niet beschikbaar")
         return imap
@@ -8859,10 +8894,77 @@ def _inv_classify(text: str):
     return "other", "Geen factuurkenmerken in de PDF gevonden."
 
 
+def _inv_kind(text: str, filename: str):
+    # Een expliciete documentnaam gaat voor toevallige verwijzingen naar
+    # factuurnummers, IBAN's of betaalvoorwaarden elders in een offerte.
+    if re.search(r"\b(offerte|quotation|proforma|orderbevestiging|opdrachtbevestiging|pakbon|tekening|voorwaarden)\b",
+                 re.sub(r"[_-]+", " ", filename), re.I):
+        return "other", "Bestandsnaam duidt op een ander document."
+    return _inv_classify(text)
+
+
+def _inv_confirmed_digests():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_confirmed "
+                     "(reference TEXT PRIMARY KEY, sent_at TEXT NOT NULL)")
+        return {row[0] for row in conn.execute("SELECT reference FROM invoice_mail_confirmed").fetchall()}
+
+
+def _inv_trash_folder(imap):
+    result, folders = imap.list()
+    if result != "OK":
+        return None
+    candidates = []
+    for raw in folders or []:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        match = re.match(r'^\(([^)]*)\)\s+(?:"[^"]*"|\S+)\s+(?:"([^"]+)"|(\S+))$', line)
+        if not match:
+            continue
+        flags, quoted, bare = match.groups()
+        name = quoted or bare
+        if "\\Noselect" in flags:
+            continue
+        if "\\Trash" in flags:
+            return name
+        if name.casefold().split("/")[-1].split(".")[-1] in {
+                "trash", "prullenbak", "deleted items", "deleted messages", "bin"}:
+            candidates.append(name)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _inv_move_completed_mail(address: str, uid: str):
+    # Verplaats een complete bronmail pas als iedere PDF als verzonden bevestigd is.
+    imap = None
+    try:
+        imap = _inv_mailbox(address, writable=True)
+        message = _inv_fetch(imap, uid)
+        pdfs = list(_inv_attachments(message))
+        confirmed = _inv_confirmed_digests()
+        if not pdfs or any(_inv_hashlib.sha256(pdf).hexdigest() not in confirmed for _, pdf in pdfs):
+            return False, "Deze mail heeft nog andere PDF-bijlagen; de mail blijft in Postvak IN."
+        trash = _inv_trash_folder(imap)
+        if not trash:
+            return False, "De prullenbakmap van dit postvak is niet herkenbaar; de mail blijft in Postvak IN."
+        try:
+            result, _ = imap.uid("MOVE", uid, trash)
+        except _inv_imaplib.IMAP4.error:
+            result = "NO"
+        if result != "OK":
+            return False, "De mailserver ondersteunt deze veilige verplaatsing niet; de mail blijft in Postvak IN."
+        return True, "Mail naar de prullenbak verplaatst."
+    except Exception:
+        return False, "Verzonden, maar verplaatsen naar de prullenbak is mislukt; controleer Postvak IN."
+    finally:
+        try:
+            if imap is not None: imap.logout()
+        except Exception: pass
+
+
 def _inv_fetch(imap, uid: str):
     if not uid.isascii() or not uid.isdigit() or len(uid)>20:
         raise HTTPException(400, "Ongeldige mailreferentie.")
-    result, data = imap.uid("FETCH", uid, "(RFC822)")
+    # PEEK voorkomt dat een scan nieuwe mails in Outlook/TransIP als gelezen markeert.
+    result, data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
     if result != "OK" or not data or not any(isinstance(item, tuple) for item in data):
         raise HTTPException(404, "Mail is niet meer beschikbaar.")
     raw = next(item[1] for item in data if isinstance(item, tuple))
@@ -8919,7 +9021,7 @@ def invoice_imap_scan(request: Request):
                         if digest in seen_pdfs:
                             continue  # Zelfde factuur in beide postvakken slechts één keer tonen.
                         seen_pdfs.add(digest)
-                        kind, reason = _inv_classify(_inv_pdf_text(pdf))
+                        kind, reason = _inv_kind(_inv_pdf_text(pdf), filename)
                         docs.append({"mailbox": address, "uid": uid, "digest": digest,
                                      "sender": sender, "received": received,
                                      "subject": str(msg.get("Subject", ""))[:200],
@@ -8930,6 +9032,9 @@ def invoice_imap_scan(request: Request):
                 except Exception: pass
         except Exception:
             errors.append(f"{address}: postvak niet ingesteld of niet bereikbaar")
+    confirmed = _inv_confirmed_digests()
+    for doc in docs:
+        doc["sent"] = doc["digest"] in confirmed
     return {"documents": docs, "errors": errors}
 
 
@@ -8948,7 +9053,7 @@ def invoice_imap_send(payload: dict, request: Request):
     if not re.fullmatch(r"[^@\s]+@e-boekhouden\.nl", destination, re.I):
         raise HTTPException(400, "Ongeldig e-Boekhouden-adres.")
     original, filename, pdf = _inv_document(str(payload.get("mailbox", "")),str(payload.get("uid", "")),str(payload.get("digest", "")))
-    kind, _ = _inv_classify(_inv_pdf_text(pdf))
+    kind, _ = _inv_kind(_inv_pdf_text(pdf), filename)
     if kind != "invoice":
         raise HTTPException(409, "Alleen als factuur herkende PDF's mogen worden doorgestuurd.")
     cfg = _quote_mail_smtp_settings()
@@ -8982,7 +9087,16 @@ def invoice_imap_send(payload: dict, request: Request):
                 smtp.send_message(mail)
     except Exception as exc:
         raise HTTPException(502, "SMTP-verzending mislukt; controleer eerst of de mail toch is aangekomen.") from exc
-    return {"sent": True}
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_confirmed "
+                     "(reference TEXT PRIMARY KEY, sent_at TEXT NOT NULL)")
+        marker = "%s" if _postgres_enabled() else "?"
+        conn.execute(f"INSERT INTO invoice_mail_confirmed (reference, sent_at) VALUES ({marker}, {marker}) "
+                     "ON CONFLICT (reference) DO NOTHING", (reference, datetime.now(timezone.utc).isoformat()))
+    moved, move_message = (False, "")
+    if payload.get("move_to_trash") is True:
+        moved, move_message = _inv_move_completed_mail(str(payload.get("mailbox", "")), str(payload.get("uid", "")))
+    return {"sent": True, "moved_to_trash": moved, "move_message": move_message}
 
 
 from vakstaal_auth import install_auth
