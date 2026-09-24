@@ -1,4 +1,5 @@
 from __future__ import annotations
+# v8 merge 2026-09-24: supplied invoice routes + v6 distinct STEP end contours; LCM timing schema 2 retained.
 import base64
 import html
 
@@ -47,6 +48,7 @@ STEP_MATERIAL_LENGTH_VERSION = 8  # full body projection along longitudinal prof
 LCM_TIMING_SCHEMA = 2  # v139: named TimeStay only; no controller delays in pierce time
 
 STEP_PROFILE_RECOGNITION_VERSION = 13  # v771: topology-based outer skin + tabs/end contours
+STEP_PHYSICAL_CUT_VERSION = 4  # v6: distinct ends on short members; preserve closed loops
 # v966: LCM writer ondersteunt Corner Speed (%) naast Define corner/B-as parameters.
 
 app = FastAPI(title="Vakstaal STEP Server", version="1.0.0")
@@ -493,7 +495,7 @@ def _analysis_cache_path(job_id: str) -> Path:
 
 
 def _assembly_cache_path(job_id: str) -> Path:
-    return CACHE_DIR / job_id / "assembly_mesh_physical_cut_v67_profile_frame.json"
+    return CACHE_DIR / job_id / "assembly_mesh_physical_cut_v68_distinct_ends.json"
 
 
 def _load_or_analyze(job_id: str, step_path: Path) -> dict:
@@ -1042,7 +1044,12 @@ def _profile_basis_for_features(
     # removing the true profile seams, but curved END arcs are no longer
     # discarded merely because they touch these anchors.
     seam_anchors: list[tuple[float, float]] = []
-    anchor_min_len = max(20.0, float(raw_length) * 0.30)
+    # v6: a short member can have real stock seams shorter than 20 mm.
+    # Require 75% of its length when that is shorter than the old 20 mm floor;
+    # leave the threshold for ordinary/long members unchanged.
+    anchor_min_len = max(
+        min(20.0, float(raw_length) * 0.75), float(raw_length) * 0.30, 1e-6
+    )
 
     for edge in solid.Edges():
         if str(edge.geomType() or "").upper() != "LINE":
@@ -1335,6 +1342,52 @@ def _outer_skin_edge_hashes(
     return result
 
 
+def _closed_cut_component_outline(component: dict, tolerance: float = 0.025):
+    """Return the actual ordered closed outline, or None; never fill a gap.
+
+    Match the frontend's closure tolerance. A closed component needs no nearby
+    edges added to it: those can belong to the opposite end or a drilled hole.
+    Coordinates and edge samples remain unmodified in the returned mesh.
+    """
+    pending = [list(edge.get("pts") or []) for edge in component.get("edges", [])]
+    pending = [points for points in pending if len(points) > 1]
+    if not pending:
+        return None
+    loop = pending.pop(0)
+    while math.dist(loop[0], loop[-1]) > tolerance:
+        best_distance, best_index, reverse = float("inf"), -1, False
+        for index, points in enumerate(pending):
+            for at_end, point in ((False, points[0]), (True, points[-1])):
+                distance = math.dist(loop[-1], point)
+                if distance < best_distance:
+                    best_distance, best_index, reverse = distance, index, at_end
+        if best_index < 0 or best_distance > tolerance:
+            return None
+        points = pending.pop(best_index)
+        if reverse:
+            points = list(reversed(points))
+        loop.extend(points[1:])
+    if pending or len(loop) < 3:
+        return None
+    return loop
+
+
+def _closed_cut_outline_wraps_axis(outline: list, basis: tuple) -> bool:
+    """Distinguish a complete end from a closed hole in a profile wall.
+
+    An end runs around the stock axis in the transverse plane. A wall hole does
+    not. This is a classification of existing CAD edges, not a generated contour.
+    Used only to resolve the old overlapping-end-zone ambiguity.
+    """
+    xy = [(x, y) for x, y, _ in _basis_coords(outline, basis)]
+    if len(xy) < 3 or any(math.hypot(x, y) < 1e-8 for x, y in xy):
+        return False
+    angle = 0.0
+    for (ax, ay), (bx, by) in zip(xy, xy[1:] + xy[:1]):
+        angle += math.atan2(ax * by - ay * bx, ax * bx + ay * by)
+    return abs(angle) > math.pi
+
+
 def _physical_cut_polylines(
     solid:cq.Shape,
     detail:dict|None,
@@ -1458,6 +1511,43 @@ def _physical_cut_polylines(
     if minus_seed is None and summaries:
         minus_seed=min(summaries,key=lambda x:x["zmean"])
 
+    # v6: wide end zones overlap on short members. Previously both max()
+    # calls could pick the SAME component. Deduplication then discarded one
+    # entire end, leaving a genuine second end in feature_lines.
+    # Resolve that ambiguity with two distinct, axially ordered candidates.
+    # Closed wall holes cannot stand in for a missing end.
+    closed_outlines = {
+        id(component): _closed_cut_component_outline(component)
+        for component in summaries
+    }
+    if plus_seed is not None and plus_seed is minus_seed:
+        terminal_candidates = [
+            component for component in summaries
+            if closed_outlines[id(component)] is None
+            or _closed_cut_outline_wraps_axis(closed_outlines[id(component)], basis)
+        ]
+        if terminal_candidates:
+            lower = min(component["zmean"] for component in terminal_candidates)
+            upper = max(component["zmean"] for component in terminal_candidates)
+            if upper - lower > 0.025:
+                split = (lower + upper) / 2.0
+                minus_seed = max(
+                    (component for component in terminal_candidates if component["zmean"] < split),
+                    key=lambda component: component["length"],
+                )
+                plus_seed = max(
+                    (component for component in terminal_candidates if component["zmean"] >= split),
+                    key=lambda component: component["length"],
+                )
+            else:
+                # Insufficient independent geometry: keep at most the one end
+                # actually present. The existing frontend validation still fails.
+                only_seed = max(terminal_candidates, key=lambda component: component["length"])
+                plus_seed = only_seed if only_seed["zmean"] >= 0 else None
+                minus_seed = only_seed if only_seed["zmean"] < 0 else None
+        else:
+            plus_seed = minus_seed = None
+
     def component_distance(a:dict,b:dict)->float:
         best=float("inf")
         for p in a.get("endpoints",[]):
@@ -1475,15 +1565,20 @@ def _physical_cut_polylines(
     join_tol=max(1.0,min(12.0,transverse*0.11))
     axial_family_tol=max(transverse*1.55,raw_length*0.075,6.0)
 
-    def grow_family(seed:dict|None)->list[dict]:
+    def grow_family(seed:dict|None,other_seed:dict|None)->list[dict]:
         if seed is None:
             return []
+        # A complete end must never absorb the other end or a nearby hole.
+        if closed_outlines.get(id(seed)) is not None:
+            return [seed]
         family=[seed]
         changed=True
         while changed:
             changed=False
             for comp in summaries:
-                if comp in family:
+                if any(comp is member for member in family) or comp is other_seed:
+                    continue
+                if closed_outlines.get(id(comp)) is not None:
                     continue
 
                 close_to_family=any(
@@ -1497,8 +1592,8 @@ def _physical_cut_polylines(
                     changed=True
         return family
 
-    plus_family=grow_family(plus_seed)
-    minus_family=grow_family(minus_seed)
+    plus_family=grow_family(plus_seed,minus_seed)
+    minus_family=grow_family(minus_seed,plus_seed)
 
     # Never let the same component belong to both end families.
     plus_ids={id(c) for c in plus_family}
@@ -8450,7 +8545,7 @@ def assembly_mesh(job_id: str):
                 "base_cut_contour_count": int(base_cut_contour_count),
                 "feature_lines": feature_lines,
                 "feature_classifier_version": 8,
-                "physical_cut_classifier_version": 3,
+                "physical_cut_classifier_version": STEP_PHYSICAL_CUT_VERSION,
                 "profile_axis": [float(v) for v in axis],
                 **_simulation_profile_frame(solid, detail),
                 "has_extra_features": bool(feature_lines),
@@ -8564,7 +8659,7 @@ def solid_mesh(job_id: str, solid_index: int):
             "base_cut_contour_count": int(base_cut_contour_count),
             "feature_lines": feature_lines,
             "feature_classifier_version": 8,
-            "physical_cut_classifier_version": 3,
+            "physical_cut_classifier_version": STEP_PHYSICAL_CUT_VERSION,
             "profile_axis": [float(v) for v in axis],
             **_simulation_profile_frame(solid, detail),
             "has_extra_features": bool(feature_lines),
@@ -8838,69 +8933,136 @@ def _inv_attachments(message):
             yield name, data
 
 
-def _inv_pdf_text(pdf: bytes) -> str:
-    if _InvPdfReader is None:
-        return ""
+def _inv_pdf_text(pdf: bytes) -> tuple[str, str]:
+    """Lees de werkelijke PDF-inhoud; OCR blijft afzonderlijk herkenbaar."""
+    extracted, source = "", "onleesbaar"
     try:
         reader = _InvPdfReader(_inv_io.BytesIO(pdf), strict=False)
         if reader.is_encrypted:
-            return ""
-        extracted = "\n".join((page.extract_text() or "") for page in reader.pages[:4])[:25000]
-        if len(extracted.strip()) >= 40:
-            return extracted
-        # Gescande PDF: OCR alleen als zowel PyMuPDF als Tesseract beschikbaar zijn.
-        try:
-            import fitz
-            document = fitz.open(stream=pdf, filetype="pdf")
+            return "", "versleuteld"
+        pages = []
+        for page in reader.pages[:4]:
+            try:
+                # Sla buitenproportioneel grote streams over vóór tekstparsing.
+                content = page.get_contents()
+                if content and len(content.get_data()) > 8_000_000:
+                    continue
+                plain = page.extract_text() or ""
+                try:
+                    layout = page.extract_text(extraction_mode="layout") or ""
+                except Exception:
+                    layout = ""
+                pages.append(layout if len(layout.strip()) >= len(plain.strip()) * .75 else plain)
+            except Exception:
+                continue
+        extracted = "\n".join(pages)[:25000]
+        if extracted.strip():
+            source = "PDF-tekst"
+    except Exception:
+        pass
+    if len(extracted.strip()) >= 300:
+        return extracted, source
+    try:
+        import fitz
+        with fitz.open(stream=pdf, filetype="pdf") as document:
+            candidate = "\n".join(page.get_text("text", sort=True) for page in list(document)[:4])[:25000]
+            if len(candidate.strip()) > len(extracted.strip()):
+                extracted, source = candidate, "PDF-tekst"
+            if len(extracted.strip()) >= 300:
+                return extracted, source
+            # OCR alleen voor een beeld-PDF met onvoldoende uitleesbare tekst.
             ocr = []
             for page in list(document)[:2]:
                 if page.rect.width * page.rect.height > 2_000_000:
-                    return extracted
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-                image = pixmap.tobytes("png")
-                try:
-                    result = _inv_subprocess.run(
-                        ["tesseract", "stdin", "stdout", "-l", "nld+eng"],
-                        input=image, capture_output=True, timeout=20, check=True)
-                except _inv_subprocess.CalledProcessError:
-                    result = _inv_subprocess.run(
-                        ["tesseract", "stdin", "stdout", "-l", "eng"],
-                        input=image, capture_output=True, timeout=20, check=True)
-                ocr.append(result.stdout.decode("utf-8", "replace"))
-            return extracted + "\n" + "\n".join(ocr)
-        except Exception:
-            return extracted
+                    break
+                if not page.get_images(full=False):
+                    continue
+                image = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).tobytes("png")
+                result = None
+                for language in ("nld+eng", "eng"):
+                    try:
+                        result = _inv_subprocess.run(["tesseract", "stdin", "stdout", "-l", language],
+                                                     input=image, capture_output=True, timeout=20, check=True)
+                        break
+                    except (_inv_subprocess.CalledProcessError, FileNotFoundError):
+                        continue
+                if result:
+                    ocr.append(result.stdout.decode("utf-8", "replace"))
+            recognized = "\n".join(ocr)[:25000]
+            if len(recognized.strip()) > len(extracted.strip()):
+                return recognized, "OCR-scan"
     except Exception:
-        return ""
+        pass
+    return extracted, source
 
 
 def _inv_classify(text: str):
-    normalized = re.sub(r"\s+", " ", text).lower()
-    if not normalized.strip():
+    lines = [re.sub(r"\s+", " ", line).strip().lower() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
         return "unreadable", "Geen leesbare tekst in PDF; controleer deze handmatig."
-    document_head = normalized[:1300]
-    if re.search(r"\b(proforma|orderbevestiging|opdrachtbevestiging|quotation|offerte|pakbon|delivery note|tekening)\b", document_head):
-        if not re.search(r"\b(factuur|invoice|creditnota|credit note)\b", document_head[:350]):
-            return "other", "Ander documenttype herkend."
-        return "review", "PDF bevat ook een ander documenttype; controleer deze."
-    title = bool(re.search(r"\b(factuur|invoice|creditnota|credit note)\b", document_head[:600]))
-    number = bool(re.search(r"\b(?:factuur|invoice|credit(?:nota| note))\s*(?:nr\.?|nummer|number|no\.?|#|:)?\s*[:#-]?\s*[a-z0-9][a-z0-9/-]{3,}\b", document_head))
-    total = bool(re.search(r"(?:totaal\s*(?:(?:te\s*betalen|incl(?:usief)?\.?\s*btw|bedrag))?|amount\s*due|total\s*(?:amount|due)?|te\s*betalen)\s*[:€\s]{0,20}(?:eur\s*)?\d[\d.,]*", normalized))
+    header = " ".join(lines[:16])[:1000]
+    normalized = " ".join(lines)[:25000]
+    other = re.compile(r"\b(?:proforma|orderbevestiging|opdrachtbevestiging|quotation|offerte|pakbon|delivery note|tekening|leveringsvoorwaarden)\b")
+    invoice = re.compile(r"\b(?:factuur|invoice|creditnota|credit note)\b")
+    # Koptekst is leidend: 'factuuradres' of 'factuurvoorwaarden' op een offerte
+    # mag nooit voldoende zijn om de offerte als factuur aan te merken.
+    header_title = bool(re.search(r"\b(?:factuur|invoice|creditnota|credit note)\b",header))
+    negative = bool(other.search(header))
+    if negative and invoice.search(" ".join(lines[:3])):
+        return "review", "Factuur verwijst ook naar een offerte of order; controleer de PDF."
+    if negative:
+        return "other", "Koptekst geeft een offerte, order of ander document aan."
+    if not header_title and not invoice.search(normalized[:1600]):
+        return "other", "Geen factuurkop in de PDF gevonden."
+    title = header_title and not re.search(r"\b(?:factuuradres|factuurgegevens|factuurvoorwaarden|invoice address)\b",header[:150])
+    number = bool(re.search(r"\b(?:factuur(?:nummer|nr\.?|\s*nummer|\s*nr\.?)?|invoice\s*(?:no\.?|number|#)|creditnota\s*(?:nr\.?|nummer)?)\s*[:#-]?\s*(?=[a-z0-9/-]*\d)[a-z0-9][a-z0-9/-]{3,}\b", normalized[:2400]))
+    total = bool(re.search(r"\b(?:totaal(?:\s*(?:te\s*betalen|incl(?:usief)?\.?\s*btw|bedrag))?|amount\s*due|total\s*(?:amount|due)?|te\s*betalen|grand\s*total)\s*[:€\s]{0,20}(?:eur\s*)?\d[\d.,]*", normalized))
     issuer = bool(re.search(r"\b(?:btw(?:-?nummer)?|vat\s*(?:id|number|no)|iban|kvk)\b", normalized))
     if title and number and total and issuer:
         return "invoice", "Factuurkop, nummer, totaal en afzendergegevens gevonden."
-    if title:
-        return "review", "Lijkt een factuur, maar niet alle kenmerken zijn gevonden."
-    return "other", "Geen factuurkenmerken in de PDF gevonden."
+    if title or number:
+        return "review", "Mogelijke factuur; controleer nummer, totaal en leverancier in de PDF."
+    return "other", "Geen duidelijke factuurgegevens in de PDF."
 
 
-def _inv_kind(text: str, filename: str):
+def _inv_kind(text: str, filename: str, source: str = "PDF-tekst"):
+    if source == "versleuteld":
+        return "unreadable", "PDF is versleuteld en kan niet worden uitgelezen."
     # Een expliciete documentnaam gaat voor toevallige verwijzingen naar
     # factuurnummers, IBAN's of betaalvoorwaarden elders in een offerte.
     if re.search(r"\b(offerte|quotation|proforma|orderbevestiging|opdrachtbevestiging|pakbon|tekening|voorwaarden)\b",
                  re.sub(r"[_-]+", " ", filename), re.I):
         return "other", "Bestandsnaam duidt op een ander document."
-    return _inv_classify(text)
+    kind, reason = _inv_classify(text)
+    if source == "OCR-scan" and kind == "invoice":
+        return "review", "Scan lijkt een factuur; controleer het origineel vanwege mogelijke OCR-fouten."
+    return kind, reason
+
+
+def _inv_analysis_key(digest: str, filename: str) -> str:
+    return digest + ":" + _inv_hashlib.sha256(filename.casefold().encode("utf-8")).hexdigest()[:16]
+
+
+def _inv_analysis_cache():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_pdf_analysis "
+                     "(reference TEXT PRIMARY KEY, classification TEXT NOT NULL, "
+                     "reason TEXT NOT NULL, text_source TEXT NOT NULL)")
+        return {row[0]: (row[1], row[2], row[3]) for row in conn.execute(
+            "SELECT reference, classification, reason, text_source FROM invoice_pdf_analysis").fetchall()}
+
+
+def _inv_save_analysis(rows):
+    if not rows:
+        return
+    with _db_connect() as conn:
+        marker = "%s" if _postgres_enabled() else "?"
+        for entry in rows:
+            conn.execute(f"INSERT INTO invoice_pdf_analysis "
+                         f"(reference, classification, reason, text_source) "
+                         f"VALUES ({marker}, {marker}, {marker}, {marker}) "
+                         "ON CONFLICT (reference) DO NOTHING", entry)
 
 
 def _inv_confirmed_digests():
@@ -8908,6 +9070,13 @@ def _inv_confirmed_digests():
         conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_confirmed "
                      "(reference TEXT PRIMARY KEY, sent_at TEXT NOT NULL)")
         return {row[0] for row in conn.execute("SELECT reference FROM invoice_mail_confirmed").fetchall()}
+
+
+def _inv_dismissed_digests():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_dismissed "
+                     "(reference TEXT PRIMARY KEY, dismissed_at TEXT NOT NULL)")
+        return {row[0] for row in conn.execute("SELECT reference FROM invoice_mail_dismissed").fetchall()}
 
 
 def _inv_trash_folder(imap):
@@ -8988,6 +9157,35 @@ def _inv_document(address: str, uid: str, digest: str):
         except Exception: pass
 
 
+def _inv_resend_document(address: str, uid: str, digest: str):
+    """Een eerder verplaatste mail is voor opnieuw verzenden ook in Prullenbak te vinden."""
+    try:
+        return _inv_document(address, uid, digest)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+    imap = _inv_mailbox(address)
+    try:
+        trash = _inv_trash_folder(imap)
+        if not trash or imap.select(trash, readonly=True)[0] != "OK":
+            raise HTTPException(404, "De originele mail is niet meer te vinden in de prullenbak.")
+        since = (datetime.now(timezone.utc)-_inv_timedelta(days=90)).strftime("%d-%b-%Y")
+        result, found = imap.uid("SEARCH", None, "SINCE", since)
+        if result == "OK":
+            for trash_uid in reversed((found[0] or b"").split()[-250:]):
+                try:
+                    message = _inv_fetch(imap, trash_uid.decode("ascii"))
+                    for name, pdf in _inv_attachments(message):
+                        if _inv_hmac.compare_digest(_inv_hashlib.sha256(pdf).hexdigest(), digest):
+                            return message, name, pdf
+                except (HTTPException, UnicodeDecodeError):
+                    continue
+        raise HTTPException(404, "De originele PDF staat niet meer in Postvak IN of Prullenbak.")
+    finally:
+        try: imap.logout()
+        except Exception: pass
+
+
 @app.get("/api/invoice-imap/status")
 def invoice_imap_status(request: Request):
     _inv_authorize(request)
@@ -9001,7 +9199,9 @@ def invoice_imap_scan(request: Request):
     if _InvPdfReader is None:
         raise HTTPException(503, "PDF-herkenning ontbreekt op de server: installeer pypdf.")
     since = (datetime.now(timezone.utc)-_inv_timedelta(days=30)).strftime("%d-%b-%Y")
-    docs, errors, seen_pdfs = [], [], set()
+    docs, errors = [], []
+    dismissed = _inv_dismissed_digests()
+    analysis, fresh_analysis = _inv_analysis_cache(), []
     for address in _INV_ADDRESSES:
         try:
             imap = _inv_mailbox(address)
@@ -9018,24 +9218,103 @@ def invoice_imap_scan(request: Request):
                     except Exception: received = ""
                     for filename, pdf in _inv_attachments(msg):
                         digest = _inv_hashlib.sha256(pdf).hexdigest()
-                        if digest in seen_pdfs:
-                            continue  # Zelfde factuur in beide postvakken slechts één keer tonen.
-                        seen_pdfs.add(digest)
-                        kind, reason = _inv_kind(_inv_pdf_text(pdf), filename)
+                        if digest in dismissed:
+                            continue
+                        # Toon ook een tweede mailkopie uit het andere postvak.
+                        # De verzendregistratie blijft per PDF-digest uniek.
+                        analysis_key = _inv_analysis_key(digest, filename)
+                        if analysis_key not in analysis:
+                            text, source = _inv_pdf_text(pdf)
+                            kind, reason = _inv_kind(text, filename, source)
+                            analysis[analysis_key] = (kind, reason, source)
+                            fresh_analysis.append((analysis_key, kind, reason, source))
+                        kind, reason, source = analysis[analysis_key]
                         docs.append({"mailbox": address, "uid": uid, "digest": digest,
                                      "sender": sender, "received": received,
                                      "subject": str(msg.get("Subject", ""))[:200],
                                      "filename": filename[:200], "size": len(pdf),
-                                     "classification": kind, "reason": reason})
+                                     "classification": kind, "reason": reason,
+                                     "text_source": source})
             finally:
                 try: imap.logout()
                 except Exception: pass
         except Exception:
             errors.append(f"{address}: postvak niet ingesteld of niet bereikbaar")
+    _inv_save_analysis(fresh_analysis)
     confirmed = _inv_confirmed_digests()
     for doc in docs:
         doc["sent"] = doc["digest"] in confirmed
     return {"documents": docs, "errors": errors}
+
+
+@app.post("/api/invoice-imap/dismiss")
+def invoice_imap_dismiss(payload: dict, request: Request):
+    _inv_authorize(request)
+    documents = payload.get("documents")
+    if not isinstance(documents, list) or not 1 <= len(documents) <= 100:
+        raise HTTPException(400, "Selecteer maximaal 100 onzekere PDF’s.")
+    confirmed = _inv_confirmed_digests()
+    digests = set()
+    for item in documents:
+        if not isinstance(item, dict):
+            raise HTTPException(400, "Ongeldige documentselectie.")
+        address, uid, digest = (str(item.get(field, "")) for field in ("mailbox", "uid", "digest"))
+        _, filename, pdf = _inv_document(address, uid, digest)
+        text, source = _inv_pdf_text(pdf)
+        kind, _ = _inv_kind(text, filename, source)
+        if kind not in {"review", "unreadable"} or digest in confirmed:
+            raise HTTPException(409, "Alleen onzekere, nog niet verstuurde PDF’s kunnen als geen factuur worden aangemerkt.")
+        digests.add(digest)
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_dismissed "
+                     "(reference TEXT PRIMARY KEY, dismissed_at TEXT NOT NULL)")
+        marker = "%s" if _postgres_enabled() else "?"
+        for digest in digests:
+            conn.execute(f"INSERT INTO invoice_mail_dismissed (reference, dismissed_at) "
+                         f"VALUES ({marker}, {marker}) ON CONFLICT (reference) DO NOTHING",
+                         (digest, datetime.now(timezone.utc).isoformat()))
+    return {"dismissed": len(digests)}
+
+
+@app.post("/api/invoice-imap/trash")
+def invoice_imap_trash(payload: dict, request: Request):
+    _inv_authorize(request)
+    address, uid = (str(payload.get(field, "")) for field in ("mailbox", "uid"))
+    requested = payload.get("digests")
+    if not isinstance(requested, list) or not 1 <= len(requested) <= 30 or any(
+            not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value) for value in requested):
+        raise HTTPException(400, "Ongeldige selectie van PDF-bijlagen.")
+    imap = _inv_mailbox(address, writable=True)
+    try:
+        message = _inv_fetch(imap, uid)
+        originals = list(_inv_attachments(message))
+        all_pdf_parts = [part for part in message.walk()
+                         if (part.get_filename() or "").lower().endswith(".pdf")]
+        if len(all_pdf_parts) != len(originals):
+            raise HTTPException(409, "Deze mail heeft ook een te grote of onleesbare PDF; verplaats hem handmatig.")
+        actual = {_inv_hashlib.sha256(pdf).hexdigest() for _, pdf in originals}
+        if not actual or actual != set(requested):
+            raise HTTPException(409, "Deze mail bevat ook andere PDF’s. Selecteer alle PDF’s uit deze mail of verplaats de mail handmatig.")
+        confirmed = _inv_confirmed_digests()
+        for filename, pdf in originals:
+            digest = _inv_hashlib.sha256(pdf).hexdigest()
+            text, source = _inv_pdf_text(pdf)
+            kind, _ = _inv_kind(text, filename, source)
+            if kind != "invoice" and digest not in confirmed:
+                raise HTTPException(409, "Deze mail bevat een PDF die niet als factuur is bevestigd; verplaats de mail handmatig.")
+        trash = _inv_trash_folder(imap)
+        if not trash:
+            raise HTTPException(503, "Prullenbakmap niet gevonden; de mail staat nog in Postvak IN.")
+        try:
+            result, _ = imap.uid("MOVE", uid, trash)
+        except _inv_imaplib.IMAP4.error as exc:
+            raise HTTPException(502, "Verplaatsen naar de prullenbak is mislukt.") from exc
+        if result != "OK":
+            raise HTTPException(502, "Verplaatsen naar de prullenbak is mislukt; de mail staat nog in Postvak IN.")
+        return {"moved": True, "mailbox": address, "uid": uid}
+    finally:
+        try: imap.logout()
+        except Exception: pass
 
 
 @app.post("/api/invoice-imap/pdf")
@@ -9052,15 +9331,25 @@ def invoice_imap_send(payload: dict, request: Request):
     destination = str(payload.get("destination", "")).strip()
     if not re.fullmatch(r"[^@\s]+@e-boekhouden\.nl", destination, re.I):
         raise HTTPException(400, "Ongeldig e-Boekhouden-adres.")
-    original, filename, pdf = _inv_document(str(payload.get("mailbox", "")),str(payload.get("uid", "")),str(payload.get("digest", "")))
-    kind, _ = _inv_kind(_inv_pdf_text(pdf), filename)
-    if kind != "invoice":
-        raise HTTPException(409, "Alleen als factuur herkende PDF's mogen worden doorgestuurd.")
+    repeat_id = str(payload.get("resend_id", ""))
+    repeat = bool(repeat_id)
+    if repeat and not re.fullmatch(r"[a-f0-9-]{36}", repeat_id):
+        raise HTTPException(400, "Ongeldige verzendbevestiging.")
+    digest = str(payload.get("digest", ""))
+    if repeat and digest not in _inv_confirmed_digests():
+        raise HTTPException(409, "Deze PDF is nog niet eerder doorgestuurd.")
+    original, filename, pdf = (_inv_resend_document if repeat else _inv_document)(
+        str(payload.get("mailbox", "")), str(payload.get("uid", "")), digest)
+    text, source = _inv_pdf_text(pdf)
+    kind, _ = _inv_kind(text, filename, source)
+    manual = payload.get("confirmed_by_user") is True
+    if kind != "invoice" and not ((manual or repeat) and kind in {"review", "unreadable"} and source != "versleuteld"):
+        raise HTTPException(409, "Open en bevestig een twijfelgeval eerst zelf; andere documenten mogen niet worden doorgestuurd.")
     cfg = _quote_mail_smtp_settings()
     if not cfg.get("host") or not cfg.get("user") or not cfg.get("password"):
         raise HTTPException(503, "SMTP-verzending is niet ingesteld op de server.")
     # Reserveer vóór het verzenden: bij een timeout kan SMTP al afgeleverd hebben.
-    reference = str(payload.get("digest"))  # Ook over beide postvakken heen idempotent.
+    reference = digest + (":repeat:" + repeat_id if repeat else "")
     with _db_connect() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_delivery (reference TEXT PRIMARY KEY, created_at TEXT NOT NULL)")
         marker = "%s" if _postgres_enabled() else "?"
@@ -9094,9 +9383,9 @@ def invoice_imap_send(payload: dict, request: Request):
         conn.execute(f"INSERT INTO invoice_mail_confirmed (reference, sent_at) VALUES ({marker}, {marker}) "
                      "ON CONFLICT (reference) DO NOTHING", (reference, datetime.now(timezone.utc).isoformat()))
     moved, move_message = (False, "")
-    if payload.get("move_to_trash") is True:
+    if not repeat and payload.get("move_to_trash") is True:
         moved, move_message = _inv_move_completed_mail(str(payload.get("mailbox", "")), str(payload.get("uid", "")))
-    return {"sent": True, "moved_to_trash": moved, "move_message": move_message}
+    return {"sent": True, "resent": repeat, "moved_to_trash": moved, "move_message": move_message}
 
 
 from vakstaal_auth import install_auth
