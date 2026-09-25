@@ -1,4 +1,5 @@
 from __future__ import annotations
+# Invoice inline review 2026-09-25; safe post-send cleanup.
 # v8 merge 2026-09-24: supplied invoice routes + v6 distinct STEP end contours; LCM timing schema 2 retained.
 import base64
 import html
@@ -9037,10 +9038,10 @@ def _inv_settings():
         row = conn.execute("SELECT destination,rules_json,auto,move_to_trash,access_enabled,auto_enabled_at "
                            "FROM invoice_account_settings WHERE id=1").fetchone()
     if not row:
-        return {"destination": "", "rules": [], "auto": False, "move_to_trash": False,
+        return {"destination": "", "rules": [], "auto": False, "move_to_trash": True,
                 "access_enabled": False, "auto_enabled_at": "", "configured": False}
     return {"destination": row[0], "rules": json.loads(row[1]), "auto": bool(row[2]),
-            "move_to_trash": bool(row[3]), "access_enabled": bool(row[4]),
+            "move_to_trash": True, "access_enabled": bool(row[4]),
             "auto_enabled_at": row[5], "configured": True}
 
 
@@ -9052,9 +9053,16 @@ def _inv_supplier_directory():
             "SELECT sender,company FROM invoice_supplier_names").fetchall()}
 
 
-def _inv_known_supplier(suggestion, sender, directory):
+def _inv_supplier_family(filename):
+    return "family:paynl" if re.match(r"^PAYNL-\d{6,47}\b", str(filename or ""), re.I) else ""
+
+
+def _inv_known_supplier(suggestion, sender, directory, filename=""):
     address = _inv_email_utils.parseaddr(str(sender or ""))[1].strip().lower()
-    company = directory.get(address)
+    if address.rsplit("@", 1)[-1] in {"vakstaal.nl", "hotmail.com", "hotmail.nl", "outlook.com",
+                                      "outlook.nl", "live.nl", "live.com", "gmail.com", "icloud.com"}:
+        address = ""
+    company = directory.get(_inv_supplier_family(filename)) or directory.get(address)
     if not company:
         return dict(suggestion)
     result = {**suggestion, "company": company}
@@ -9134,7 +9142,7 @@ def invoice_imap_preferences_save(payload: dict, request: Request):
                      "rules_json=excluded.rules_json,auto=excluded.auto, "
                      "move_to_trash=excluded.move_to_trash,access_enabled=excluded.access_enabled, "
                      "auto_enabled_at=excluded.auto_enabled_at",
-                     (destination, json.dumps(rules), int(auto), int(payload.get("move_to_trash") is True),
+                     (destination, json.dumps(rules), int(auto), 1,
                       int(remember), auto_enabled_at))
     return {"saved": True, "access_enabled": remember}
 
@@ -9154,15 +9162,30 @@ def invoice_imap_supplier_name(payload: dict, request: Request):
     company = _inv_name_part(payload.get("company"), 55).lower()
     if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", sender) or not 2 <= len(company) <= 55:
         raise HTTPException(422, "Controleer afzender en bedrijfsnaam.")
+    _inv_learn_supplier(sender, company, payload.get("filename", ""))
+    return {"saved": True, "company": company}
+
+
+def _inv_learn_supplier(sender, company, filename=""):
+    sender = _inv_email_utils.parseaddr(str(sender or ""))[1].lower()
+    domain = sender.rsplit("@", 1)[-1]
+    keys = []
+    family = _inv_supplier_family(filename)
+    if family:
+        keys.append(family)
+    # Een doorgestuurde mail kan facturen van verschillende leveranciers bevatten.
+    if "@" in sender and domain not in {"vakstaal.nl", "hotmail.com", "hotmail.nl", "outlook.com",
+                                        "outlook.nl", "live.nl", "live.com", "gmail.com", "icloud.com"}:
+        keys.append(sender)
     with _db_connect() as conn:
         marker = "%s" if _postgres_enabled() else "?"
         conn.execute("CREATE TABLE IF NOT EXISTS invoice_supplier_names "
                      "(sender TEXT PRIMARY KEY, company TEXT NOT NULL, updated_at TEXT NOT NULL)")
-        conn.execute(f"INSERT INTO invoice_supplier_names(sender,company,updated_at) "
-                     f"VALUES ({marker},{marker},{marker}) ON CONFLICT (sender) DO UPDATE SET "
-                     "company=excluded.company,updated_at=excluded.updated_at",
-                     (sender, company, datetime.now(timezone.utc).isoformat()))
-    return {"saved": True, "company": company}
+        for key in keys:
+            conn.execute(f"INSERT INTO invoice_supplier_names(sender,company,updated_at) "
+                         f"VALUES ({marker},{marker},{marker}) ON CONFLICT (sender) DO UPDATE SET "
+                         "company=excluded.company,updated_at=excluded.updated_at",
+                         (key, company, datetime.now(timezone.utc).isoformat()))
 
 
 def _inv_mailbox(address: str, *, writable: bool = False):
@@ -9382,7 +9405,7 @@ def _inv_name_suggestion(text: str, sender: str):
     number_label = re.compile(r"\b(?:factuur\s*(?:nummer|nr\.?|no\.?)|factuurnr\.?|"
                               r"invoice\s*(?:number|no\.?|#)|creditnota\s*(?:nummer|nr\.?)|factuur(?=\s*[:#.-]?\s*\d))"
                               r"\s*[:#.-]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{1,45})", re.I)
-    number_only = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{1,47}")
+    number_only = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/ -]{0,47}")
     for position, line in enumerate(lines):
         match = number_label.search(line)
         if match and re.search(r"\d", match.group(1)):
@@ -9424,12 +9447,17 @@ def _inv_name_suggestion(text: str, sender: str):
 def _inv_name_with_filename(text: str, sender: str, filename: str):
     """Een bestandsnaam kan helpen bij handmatige controle, maar is geen PDF-bewijs."""
     suggestion = _inv_name_suggestion(text, sender)
+    if _inv_supplier_family(filename) and not suggestion["company"]:
+        suggestion["company"] = "pay"
+        suggestion["company_basis"] = "bestandsnaam"
+        suggestion["complete"] = False
     if suggestion["number"]:
+        suggestion["missing"] = [key for key in ("year", "company", "number") if not suggestion[key]]
         return suggestion
     base = re.sub(r"\.pdf$", "", str(filename or ""), flags=re.I).strip()
     match = re.search(r"\b(?:factuur(?:nummer|nr)?|invoice)\s*[-_ #.:]*"
                       r"([A-Za-z0-9][A-Za-z0-9._/-]{2,47})\b", base, re.I)
-    if not match and _inv_email_utils.parseaddr(str(sender or ""))[1].lower().endswith("@pay.nl"):
+    if not match and _inv_supplier_family(filename):
         # Pay vermeldt het PAYNL-kenmerk vooraan in de bijlagenaam. Alleen
         # als voorstel tonen; dit mag nooit automatische verzending starten.
         match = re.match(r"(PAYNL-\d{6,47})\b", base, re.I)
@@ -9450,16 +9478,86 @@ def _inv_final_filename(text: str, sender: str, supplied=None):
               for key in ("year", "company", "number")}
     if not re.fullmatch(r"20\d{2}", fields["year"]):
         raise HTTPException(422, "Factuurjaartal ontbreekt; vul dit uit de PDF in.")
-    if not re.fullmatch(r"[\w .&-]{2,70}", fields["company"], re.UNICODE):
+    if not 2 <= len(fields["company"]) <= 70 or re.search(r"[\x00-\x1f\x7f]", fields["company"]):
         raise HTTPException(422, "Bedrijfsnaam ontbreekt of is ongeldig; controleer de PDF.")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{1,47}", fields["number"]) or not re.search(r"\d", fields["number"]):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/ -]{0,47}", fields["number"]) or not re.search(r"\d", fields["number"]):
         raise HTTPException(422, "Factuurnummer ontbreekt of is ongeldig; controleer de PDF.")
     company = _inv_name_part(fields["company"], 55).lower()
     number = _inv_name_part(fields["number"], 48)
-    if len(company) < 2 or len(number) < 2:
+    if len(company) < 2 or len(number) < 1:
         raise HTTPException(422, "Vul bedrijfsnaam en factuurnummer in.")
-    return {"year": fields["year"], "company": company, "number": number,
+    return {"year": fields["year"], "company": fields["company"], "number": fields["number"],
             "filename": f"{fields['year']} {company} {number}.pdf"}
+
+
+def _inv_review_entries():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_pdf_review ("
+                     "reference TEXT PRIMARY KEY, details TEXT NOT NULL, approved INTEGER NOT NULL, "
+                     "updated_at TEXT NOT NULL)")
+        return {row[0]: {"invoice_name": json.loads(row[1]), "approved": bool(row[2])}
+                for row in conn.execute("SELECT reference,details,approved FROM invoice_pdf_review").fetchall()}
+
+
+def _inv_draft_details(value):
+    if not isinstance(value, dict):
+        raise HTTPException(422, "Ongeldige factuurgegevens.")
+    fields = {}
+    for key, maximum in (("year", 4), ("company", 70), ("number", 48)):
+        raw = value.get(key, "")
+        if not isinstance(raw, str) or len(raw) > maximum:
+            raise HTTPException(422, "Controleer de ingevulde factuurgegevens.")
+        fields[key] = raw.strip()
+    # Een concept mag onvolledig zijn. Pas bij bevestigen zijn alle velden verplicht.
+    try:
+        final = _inv_final_filename("", "", fields)
+        return {**final, "complete": True, "basis": "Handmatig opgeslagen"}
+    except HTTPException:
+        return {**fields, "complete": False, "filename": "", "basis": "Concept"}
+
+
+@app.post("/api/invoice-imap/review")
+def invoice_imap_review(payload: dict, request: Request):
+    _inv_authorize(request)
+    digest = str(payload.get("digest", ""))
+    if not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise HTTPException(422, "Ongeldige PDF-verwijzing.")
+    details = _inv_draft_details(payload.get("invoice_name"))
+    confirm = payload.get("confirm") is True
+    sender, filename = str(payload.get("sender", "")), str(payload.get("filename", ""))
+    if confirm:
+        if not details["complete"]:
+            raise HTTPException(422, "Vul jaartal, bedrijfsnaam en factuurnummer in voordat je bevestigt.")
+        original, filename, pdf = (_inv_resend_document if payload.get("previously_sent") is True else _inv_document)(
+            str(payload.get("mailbox", "")), str(payload.get("uid", "")), digest)
+        _, source = _inv_pdf_text(pdf)
+        if source == "versleuteld":
+            raise HTTPException(409, "Deze PDF is versleuteld; gebruik een leesbare PDF.")
+        sender = str(original.get("From", ""))
+    _inv_review_entries()  # Zorg ook bij de eerste opslag dat de tabel bestaat.
+    with _db_connect() as conn:
+        marker = "%s" if _postgres_enabled() else "?"
+        conn.execute(f"INSERT INTO invoice_pdf_review(reference,details,approved,updated_at) "
+                     f"VALUES ({marker},{marker},{marker},{marker}) ON CONFLICT (reference) DO UPDATE SET "
+                     "details=excluded.details,approved=excluded.approved,updated_at=excluded.updated_at",
+                     (digest, json.dumps(details, ensure_ascii=False), int(confirm),
+                      datetime.now(timezone.utc).isoformat()))
+    company = _inv_name_part(details["company"], 55).lower()
+    if confirm and len(company) >= 2:
+        _inv_learn_supplier(sender, company, filename)
+    return {"saved": True, "approved": confirm, "invoice_name": details}
+
+
+def _inv_approved_name(digest, supplied=None):
+    review = _inv_review_entries().get(digest)
+    if not review or not review["approved"]:
+        raise HTTPException(409, "Bevestig deze PDF eerst met ‘Factuur bevestigen’.")
+    details = review["invoice_name"]
+    if supplied is not None:
+        given = _inv_final_filename("", "", supplied)
+        if any(given[key] != details[key] for key in ("year", "company", "number")):
+            raise HTTPException(409, "Factuurgegevens zijn gewijzigd. Bevestig de factuur opnieuw.")
+    return details
 
 
 def _inv_analysis_key(digest: str, filename: str) -> str:
@@ -9561,32 +9659,78 @@ def _inv_trash_folder(imap):
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _inv_move_completed_mail(address: str, uid: str):
-    # Verplaats een complete bronmail pas als iedere PDF als verzonden bevestigd is.
+def _inv_has_unprocessed_pdf_parts(message, pdfs):
+    """Never remove hidden/oversized/broken PDF attachments just because scanning skipped them."""
+    parts = [part for part in message.walk() if not part.is_multipart() and (
+        (part.get_filename() or "").lower().endswith(".pdf") or
+        part.get_content_type().lower() == "application/pdf")]
+    return len(parts) != len(pdfs)
+
+
+def _inv_quoted_folder(name):
+    # IMAP mailbox names can contain spaces, quotes, or backslashes.
+    return '"' + str(name).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def _inv_move_completed_mail(address: str, uid: str, expected_digest: str = ""):
+    # A source message can move only after every PDF was submitted or explicitly dismissed.
     imap = None
     try:
         imap = _inv_mailbox(address, writable=True)
         message = _inv_fetch(imap, uid)
         pdfs = list(_inv_attachments(message))
+        if not pdfs or _inv_has_unprocessed_pdf_parts(message, pdfs):
+            return False, "Deze bronmail bevat een te grote, onleesbare of niet herkende PDF en blijft in Postvak IN."
+        actual = {_inv_hashlib.sha256(pdf).hexdigest() for _, pdf in pdfs}
+        if expected_digest and expected_digest not in actual:
+            return False, "De bronmail komt niet meer overeen met de factuur; de mail is niet verplaatst."
         confirmed = _inv_confirmed_digests()
-        if not pdfs or any(_inv_hashlib.sha256(pdf).hexdigest() not in confirmed for _, pdf in pdfs):
-            return False, "Deze mail heeft nog andere PDF-bijlagen; de mail blijft in Postvak IN."
+        dismissed = _inv_dismissed_digests()
+        # At least one successfully submitted PDF is required; never delete a merely approved draft.
+        if not actual.intersection(confirmed) or not actual.issubset(confirmed | dismissed):
+            return False, "Deze bronmail heeft nog niet afgehandelde PDF-bijlagen en blijft in Postvak IN."
         trash = _inv_trash_folder(imap)
         if not trash:
             return False, "De prullenbakmap van dit postvak is niet herkenbaar; de mail blijft in Postvak IN."
         try:
-            result, _ = imap.uid("MOVE", uid, trash)
+            result, _ = imap.uid("MOVE", uid, _inv_quoted_folder(trash))
         except _inv_imaplib.IMAP4.error:
             result = "NO"
         if result != "OK":
-            return False, "De mailserver ondersteunt deze veilige verplaatsing niet; de mail blijft in Postvak IN."
-        return True, "Mail naar de prullenbak verplaatst."
+            return False, "Veilig verplaatsen naar de prullenbak is niet gelukt; controleer Postvak IN."
+        return True, "Bronmail naar de prullenbak verplaatst."
     except Exception:
-        return False, "Verzonden, maar verplaatsen naar de prullenbak is mislukt; controleer Postvak IN."
+        return False, "Factuur doorgestuurd, maar verplaatsen naar de prullenbak is mislukt; controleer Postvak IN."
     finally:
         try:
             if imap is not None: imap.logout()
         except Exception: pass
+
+
+@app.post("/api/invoice-imap/cleanup")
+def invoice_imap_cleanup(payload: dict, request: Request):
+    """Retry moving submitted source mails, without ever submitting a PDF a second time."""
+    _inv_authorize(request)
+    documents = payload.get("documents")
+    if not isinstance(documents, list) or not 1 <= len(documents) <= 100:
+        raise HTTPException(422, "Selecteer 1 tot 100 bronmails om af te handelen.")
+    confirmed = _inv_confirmed_digests()
+    groups = {}
+    # Validate the entire request before making mailbox changes.
+    for doc in documents:
+        if not isinstance(doc, dict):
+            raise HTTPException(422, "Ongeldige bronmail.")
+        address, uid, digest = (str(doc.get(key, "")) for key in ("mailbox", "uid", "digest"))
+        if address not in _INV_ADDRESSES or not re.fullmatch(r"[0-9]{1,20}", uid) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise HTTPException(422, "Ongeldige bronmail of PDF-verwijzing.")
+        if digest not in confirmed:
+            raise HTTPException(409, "Deze PDF is niet succesvol doorgestuurd; de bronmail blijft staan.")
+        groups.setdefault((address, uid), digest)
+    results = []
+    for (address, uid), digest in groups.items():
+        moved, message = _inv_move_completed_mail(address, uid, digest)
+        results.append({"mailbox": address, "uid": uid, "moved_to_trash": moved, "move_message": message})
+    return {"results": results, "moved": sum(item["moved_to_trash"] for item in results)}
 
 
 def _inv_fetch(imap, uid: str):
@@ -9627,7 +9771,7 @@ def _inv_resend_document(address: str, uid: str, digest: str):
     imap = _inv_mailbox(address)
     try:
         trash = _inv_trash_folder(imap)
-        if not trash or imap.select(trash, readonly=True)[0] != "OK":
+        if not trash or imap.select(_inv_quoted_folder(trash), readonly=True)[0] != "OK":
             raise HTTPException(404, "De originele mail is niet meer te vinden in de prullenbak.")
         since = (datetime.now(timezone.utc)-_inv_timedelta(days=90)).strftime("%d-%b-%Y")
         result, found = imap.uid("SEARCH", None, "SINCE", since)
@@ -9669,6 +9813,7 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
     names, fresh_names = _inv_name_cache(), []
     amounts, fresh_amounts = _inv_amount_cache(), []
     suppliers = _inv_supplier_directory()
+    reviews = _inv_review_entries()
     for address in ((mailbox,) if mailbox else _INV_ADDRESSES):
         try:
             imap = _inv_mailbox(address)
@@ -9699,14 +9844,14 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
                         kind, reason, source = analysis[analysis_key]
                         name = None
                         if kind in {"invoice", "review"}:
-                            name_key = _inv_analysis_key(digest, filename) + ":n3"
+                            name_key = _inv_analysis_key(digest, filename) + ":n4"
                             name = names.get(name_key)
-                            if not isinstance(name, dict) or name.get("extractor_version") != 3:
+                            if not isinstance(name, dict) or name.get("extractor_version") != 4:
                                 if text is None:
                                     text, source = _inv_pdf_text(pdf)
                                 name = _inv_name_with_filename(text, sender, filename)
                                 name["basis"] = source
-                                name["extractor_version"] = 3
+                                name["extractor_version"] = 4
                                 if source != "PDF-tekst":
                                     name["complete"] = False
                                 names[name_key] = name
@@ -9720,15 +9865,17 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
                                 amounts[amount_key] = _inv_total_amount(text)
                                 fresh_amounts.append((amount_key, amounts[amount_key]))
                             amount = amounts[amount_key]
-                        visible_name = _inv_known_supplier(name, sender, suppliers) if name else None
+                        visible_name = _inv_known_supplier(name, sender, suppliers, filename) if name else None
                         if visible_name and (source != "PDF-tekst" or kind != "invoice"):
                             visible_name["complete"] = False
+                        review = reviews.get(digest, {})
                         docs.append({"mailbox": address, "uid": uid, "digest": digest,
                                      "sender": sender, "received": received,
                                      "subject": str(msg.get("Subject", ""))[:200],
                                      "filename": filename[:200], "size": len(pdf),
-                                     "classification": kind, "reason": reason,
+                                     "classification": "invoice" if review.get("approved") else kind, "reason": reason,
                                      "text_source": source, "invoice_name": visible_name,
+                                     "invoice_draft": review.get("invoice_name"), "approved": bool(review.get("approved")),
                                      "amount": amount})
             finally:
                 try: imap.logout()
@@ -9788,23 +9935,24 @@ def invoice_imap_trash(payload: dict, request: Request):
         originals = list(_inv_attachments(message))
         all_pdf_parts = [part for part in message.walk()
                          if (part.get_filename() or "").lower().endswith(".pdf")]
-        if len(all_pdf_parts) != len(originals):
+        if _inv_has_unprocessed_pdf_parts(message, originals):
             raise HTTPException(409, "Deze mail heeft ook een te grote of onleesbare PDF; verplaats hem handmatig.")
         actual = {_inv_hashlib.sha256(pdf).hexdigest() for _, pdf in originals}
         if not actual or actual != set(requested):
             raise HTTPException(409, "Deze mail bevat ook andere PDF’s. Selecteer alle PDF’s uit deze mail of verplaats de mail handmatig.")
         confirmed = _inv_confirmed_digests()
+        accepted = {key for key, entry in _inv_review_entries().items() if entry["approved"]}
         for filename, pdf in originals:
             digest = _inv_hashlib.sha256(pdf).hexdigest()
             text, source = _inv_pdf_text(pdf)
             kind, _ = _inv_kind(text, filename, source)
-            if kind != "invoice" and digest not in confirmed:
+            if kind != "invoice" and digest not in confirmed and digest not in accepted:
                 raise HTTPException(409, "Deze mail bevat een PDF die niet als factuur is bevestigd; verplaats de mail handmatig.")
         trash = _inv_trash_folder(imap)
         if not trash:
             raise HTTPException(503, "Prullenbakmap niet gevonden; de mail staat nog in Postvak IN.")
         try:
-            result, _ = imap.uid("MOVE", uid, trash)
+            result, _ = imap.uid("MOVE", uid, _inv_quoted_folder(trash))
         except _inv_imaplib.IMAP4.error as exc:
             raise HTTPException(502, "Verplaatsen naar de prullenbak is mislukt.") from exc
         if result != "OK":
@@ -9818,7 +9966,8 @@ def invoice_imap_trash(payload: dict, request: Request):
 @app.post("/api/invoice-imap/pdf")
 def invoice_imap_pdf(payload: dict, request: Request):
     _inv_authorize(request)
-    _, name, pdf = _inv_document(str(payload.get("mailbox", "")), str(payload.get("uid", "")), str(payload.get("digest", "")))
+    _, name, pdf = (_inv_resend_document if payload.get("previously_sent") is True else _inv_document)(
+        str(payload.get("mailbox", "")), str(payload.get("uid", "")), str(payload.get("digest", "")))
     return Response(content=pdf, media_type="application/pdf",
                     headers={"Content-Disposition": "inline; filename=invoice.pdf", "Cache-Control": "no-store"})
 
@@ -9826,12 +9975,15 @@ def invoice_imap_pdf(payload: dict, request: Request):
 @app.post("/api/invoice-imap/name")
 def invoice_imap_name(payload: dict, request: Request):
     _inv_authorize(request)
+    review = _inv_review_entries().get(str(payload.get("digest", "")))
+    if review:
+        return review["invoice_name"]
     original, filename, pdf = _inv_resend_document(str(payload.get("mailbox", "")),
         str(payload.get("uid", "")), str(payload.get("digest", ""))) if payload.get("previously_sent") is True else _inv_document(
         str(payload.get("mailbox", "")), str(payload.get("uid", "")), str(payload.get("digest", "")))
     text, source = _inv_pdf_text(pdf)
     suggestion = _inv_known_supplier(_inv_name_with_filename(text, str(original.get("From", "")), filename),
-                                     str(original.get("From", "")), _inv_supplier_directory())
+                                     str(original.get("From", "")), _inv_supplier_directory(), filename)
     suggestion["basis"] = source
     if source != "PDF-tekst":
         suggestion["complete"] = False  # OCR en onleesbare PDF's altijd zelf controleren.
@@ -9849,16 +10001,15 @@ def invoice_imap_send(payload: dict, request: Request):
     if repeat and not re.fullmatch(r"[a-f0-9-]{36}", repeat_id):
         raise HTTPException(400, "Ongeldige verzendbevestiging.")
     digest = str(payload.get("digest", ""))
+    final_name = _inv_approved_name(digest, payload.get("invoice_name"))
     if repeat and digest not in _inv_confirmed_digests():
         raise HTTPException(409, "Deze PDF is nog niet eerder doorgestuurd.")
     original, filename, pdf = (_inv_resend_document if repeat else _inv_document)(
         str(payload.get("mailbox", "")), str(payload.get("uid", "")), digest)
     text, source = _inv_pdf_text(pdf)
     kind, _ = _inv_kind(text, filename, source)
-    manual = payload.get("confirmed_by_user") is True
-    if kind != "invoice" and not ((manual or repeat) and kind in {"review", "unreadable"} and source != "versleuteld"):
-        raise HTTPException(409, "Open en bevestig een twijfelgeval eerst zelf; andere documenten mogen niet worden doorgestuurd.")
-    final_name = _inv_final_filename(text, str(original.get("From", "")), payload.get("invoice_name"))
+    if source == "versleuteld":
+        raise HTTPException(409, "Deze PDF is versleuteld; gebruik een leesbare PDF.")
     cfg = _inv_smtp_settings()
     # Reserveer vóór het verzenden: bij een timeout kan SMTP al afgeleverd hebben.
     reference = digest + (":repeat:" + repeat_id if repeat else "")
@@ -9897,8 +10048,8 @@ def invoice_imap_send(payload: dict, request: Request):
         conn.execute(f"INSERT INTO invoice_mail_confirmed (reference, sent_at) VALUES ({marker}, {marker}) "
                      "ON CONFLICT (reference) DO NOTHING", (reference, datetime.now(timezone.utc).isoformat()))
     moved, move_message = (False, "")
-    if not repeat and payload.get("move_to_trash") is True:
-        moved, move_message = _inv_move_completed_mail(str(payload.get("mailbox", "")), str(payload.get("uid", "")))
+    if not repeat:
+        moved, move_message = _inv_move_completed_mail(str(payload.get("mailbox", "")), str(payload.get("uid", "")), digest)
     return {"sent": True, "resent": repeat, "submitted_to_smtp": True,
             "forwarding_from": cfg["from"], "filename": final_name["filename"],
             "moved_to_trash": moved, "move_message": move_message}
