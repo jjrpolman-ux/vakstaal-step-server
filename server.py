@@ -9235,6 +9235,33 @@ def _inv_attachments(message):
             yield name, data
 
 
+def _inv_invoice_attachments(message):
+    """Return only the PDF attachment(s) that represent the payable invoice.
+
+    WEX/EssoCardOnline mails contain two PDFs: an ``invoice_ES...`` electronic
+    invoice document and a ``PAY_...`` PDF. For Vakstaal the PAY PDF is the
+    document that must be read, shown and forwarded. When a PAY attachment is
+    present in a WEX/Esso mail it is therefore authoritative; the companion
+    invoice_ES PDF is intentionally ignored by the invoice workflow.
+
+    The rule is deliberately scoped to WEX/Esso messages and falls back to all
+    valid PDFs if WEX changes its filename format, so unrelated suppliers are
+    unaffected and a renamed invoice is never silently lost.
+    """
+    pdfs = list(_inv_attachments(message))
+    if not pdfs:
+        return []
+    sender = _inv_email_utils.parseaddr(str(message.get("From", "")))[1].lower()
+    subject = str(message.get("Subject", ""))
+    wex_esso = ("wexeurope" in sender or
+                bool(re.search(r"\besso\s*card(?:online)?\b", subject, re.I)))
+    if not wex_esso:
+        return pdfs
+    preferred = [(name, pdf) for name, pdf in pdfs
+                 if re.match(r"^PAY_[^/\\]*\.pdf$", Path(str(name)).name, re.I)]
+    return preferred or pdfs
+
+
 def _inv_pdf_text(pdf: bytes) -> tuple[str, str]:
     """Lees iedere pagina; gebruik OCR voor pagina's met weinig tekst."""
     pages = []
@@ -9777,9 +9804,12 @@ def _inv_move_completed_mail(address: str, uid: str, expected_digest: str = ""):
         message = _inv_fetch(imap, uid)
         if _inv_message_key(address, message) in _inv_rejected_messages():
             return False, "Deze mail is niet geaccepteerd en blijft in Postvak IN staan."
-        pdfs = list(_inv_attachments(message))
-        if not pdfs or _inv_has_unprocessed_pdf_parts(message, pdfs):
+        all_pdfs = list(_inv_attachments(message))
+        if not all_pdfs or _inv_has_unprocessed_pdf_parts(message, all_pdfs):
             return False, "Deze bronmail bevat een te grote, onleesbare of niet herkende PDF en blijft in Postvak IN."
+        pdfs = _inv_invoice_attachments(message)
+        if not pdfs:
+            return False, "In deze bronmail is geen bruikbare factuur-PDF gevonden; de mail blijft in Postvak IN."
         actual = {_inv_hashlib.sha256(pdf).hexdigest() for _, pdf in pdfs}
         if expected_digest and expected_digest not in actual:
             return False, "De bronmail komt niet meer overeen met de factuur; de mail is niet verplaatst."
@@ -9850,7 +9880,7 @@ def _inv_document(address: str, uid: str, digest: str):
     imap = _inv_mailbox(address)
     try:
         msg = _inv_fetch(imap, uid)
-        for name, pdf in _inv_attachments(msg):
+        for name, pdf in _inv_invoice_attachments(msg):
             if _inv_hmac.compare_digest(_inv_hashlib.sha256(pdf).hexdigest(), digest):
                 return msg, name, pdf
         raise HTTPException(404, "PDF is verwijderd of gewijzigd.")
@@ -9877,7 +9907,7 @@ def _inv_resend_document(address: str, uid: str, digest: str):
             for trash_uid in reversed((found[0] or b"").split()[-250:]):
                 try:
                     message = _inv_fetch(imap, trash_uid.decode("ascii"))
-                    for name, pdf in _inv_attachments(message):
+                    for name, pdf in _inv_invoice_attachments(message):
                         if _inv_hmac.compare_digest(_inv_hashlib.sha256(pdf).hexdigest(), digest):
                             return message, name, pdf
                 except (HTTPException, UnicodeDecodeError):
@@ -9930,7 +9960,7 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
                     received = str(msg.get("Date", ""))
                     try: received = _inv_parsedate(received).astimezone(timezone.utc).isoformat()
                     except Exception: received = ""
-                    for filename, pdf in _inv_attachments(msg):
+                    for filename, pdf in _inv_invoice_attachments(msg):
                         digest = _inv_hashlib.sha256(pdf).hexdigest()
                         # Toon ook een tweede mailkopie uit het andere postvak.
                         # De verzendregistratie blijft per PDF-digest uniek.
@@ -10048,11 +10078,10 @@ def invoice_imap_trash(payload: dict, request: Request):
     imap = _inv_mailbox(address, writable=True)
     try:
         message = _inv_fetch(imap, uid)
-        originals = list(_inv_attachments(message))
-        all_pdf_parts = [part for part in message.walk()
-                         if (part.get_filename() or "").lower().endswith(".pdf")]
-        if _inv_has_unprocessed_pdf_parts(message, originals):
+        all_valid_pdfs = list(_inv_attachments(message))
+        if _inv_has_unprocessed_pdf_parts(message, all_valid_pdfs):
             raise HTTPException(409, "Deze mail heeft ook een te grote of onleesbare PDF; verplaats hem handmatig.")
+        originals = _inv_invoice_attachments(message)
         actual = {_inv_hashlib.sha256(pdf).hexdigest() for _, pdf in originals}
         if not actual or actual != set(requested):
             raise HTTPException(409, "Deze mail bevat ook andere PDF’s. Selecteer alle PDF’s uit deze mail of verplaats de mail handmatig.")
