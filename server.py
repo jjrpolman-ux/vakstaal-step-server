@@ -1266,8 +1266,22 @@ def _point_key(p:list[float],tol:float=0.12)->tuple[int,int,int]:
 
 
 def _connected_edge_components(items:list[dict],tol:float=0.12)->list[list[dict]]:
+    """Group physical edges by endpoint distance, not rounded hash equality.
+
+    v1225: the old rounded point key could split two endpoints that were
+    geometrically identical when their coordinate lay exactly on a rounding
+    boundary (for example 1734.9 / 0.2 = 8674.5). Tiny STEP floating-point
+    noise then rounded one endpoint down and the matching endpoint up. That
+    split one valid U-shaped notch into two feature contours.
+
+    Use a small spatial grid only as an accelerator and confirm every match
+    with the real Euclidean distance. Endpoints in neighbouring cells are also
+    checked, so cell boundaries can no longer break a contour.
+    """
     if not items:
         return []
+
+    tolerance=max(float(tol or 0.12),1e-6)
     parent=list(range(len(items)))
 
     def find(i:int)->int:
@@ -1281,15 +1295,26 @@ def _connected_edge_components(items:list[dict],tol:float=0.12)->list[list[dict]
         if a!=b:
             parent[b]=a
 
-    owners={}
+    def cell(point):
+        return tuple(int(math.floor(float(point[k])/tolerance)) for k in range(3))
+
+    buckets:dict[tuple[int,int,int],list[tuple[int,list[float]]]]={}
     for i,item in enumerate(items):
-        pts=item["pts"]
-        for p in (pts[0],pts[-1]):
-            key=_point_key(p,tol)
-            if key in owners:
-                union(i,owners[key])
-            else:
-                owners[key]=i
+        pts=item.get("pts") or []
+        if len(pts)<2:
+            continue
+        for point in (pts[0],pts[-1]):
+            c=cell(point)
+            for dx in (-1,0,1):
+                for dy in (-1,0,1):
+                    for dz in (-1,0,1):
+                        for other_i,other_point in buckets.get((c[0]+dx,c[1]+dy,c[2]+dz),[]):
+                            try:
+                                if math.dist(point,other_point)<=tolerance+1e-9:
+                                    union(i,other_i)
+                            except Exception:
+                                pass
+            buckets.setdefault(c,[]).append((i,point))
 
     groups={}
     for i,item in enumerate(items):
