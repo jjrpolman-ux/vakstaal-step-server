@@ -1,5 +1,5 @@
 from __future__ import annotations
-# Invoice inline review 2026-09-25; safe post-send cleanup.
+# Invoice review 2026-09-25b; persistent per-message rejection, safe post-send cleanup.
 # v8 merge 2026-09-24: supplied invoice routes + v6 distinct STEP end contours; LCM timing schema 2 retained.
 import base64
 import html
@@ -9522,6 +9522,11 @@ def invoice_imap_review(payload: dict, request: Request):
     digest = str(payload.get("digest", ""))
     if not re.fullmatch(r"[a-f0-9]{64}", digest):
         raise HTTPException(422, "Ongeldige PDF-verwijzing.")
+    message_key = payload.get("message_key")
+    if message_key is not None and (not isinstance(message_key, str) or not re.fullmatch(r"[a-f0-9]{64}", message_key)):
+        raise HTTPException(422, "Ongeldige mailidentiteit.")
+    if message_key in _inv_rejected_messages():
+        raise HTTPException(409, "Deze mail is niet geaccepteerd. Het concept is niet gewijzigd.")
     details = _inv_draft_details(payload.get("invoice_name"))
     confirm = payload.get("confirm") is True
     sender, filename = str(payload.get("sender", "")), str(payload.get("filename", ""))
@@ -9530,6 +9535,7 @@ def invoice_imap_review(payload: dict, request: Request):
             raise HTTPException(422, "Vul jaartal, bedrijfsnaam en factuurnummer in voordat je bevestigt.")
         original, filename, pdf = (_inv_resend_document if payload.get("previously_sent") is True else _inv_document)(
             str(payload.get("mailbox", "")), str(payload.get("uid", "")), digest)
+        _inv_assert_mail_active(str(payload.get("mailbox", "")), original, payload)
         _, source = _inv_pdf_text(pdf)
         if source == "versleuteld":
             raise HTTPException(409, "Deze PDF is versleuteld; gebruik een leesbare PDF.")
@@ -9551,7 +9557,7 @@ def invoice_imap_review(payload: dict, request: Request):
 def _inv_approved_name(digest, supplied=None):
     review = _inv_review_entries().get(digest)
     if not review or not review["approved"]:
-        raise HTTPException(409, "Bevestig deze PDF eerst met ‘Factuur bevestigen’.")
+        raise HTTPException(409, "Bevestig deze PDF eerst met ‘Factuur accepteren’.")
     details = review["invoice_name"]
     if supplied is not None:
         given = _inv_final_filename("", "", supplied)
@@ -9637,6 +9643,78 @@ def _inv_dismissed_digests():
         return {row[0] for row in conn.execute("SELECT reference FROM invoice_mail_dismissed").fetchall()}
 
 
+def _inv_message_key(address: str, message) -> str:
+    """Stable mail identity, scoped to the mailbox; never a sender/PDF-wide exclusion.
+
+    Ignore IMAP UIDs, which can change after moving a message. Include content
+    evidence to distinguish a supplier reusing a Message-ID. Without Message-ID,
+    use the complete message (including transport headers) to avoid collapsing
+    separate deliveries that happen to have identical attachments.
+    """
+    message_id = str(message.get("Message-ID", "")).strip()
+    if message_id:
+        evidence = [message_id] + [str(message.get(k, "")) for k in ("From", "Date", "Subject")]
+        for part in message.walk():
+            if part.is_multipart():
+                continue
+            data = part.get_payload(decode=True)
+            if data is None:
+                data = str(part.get_payload()).encode("utf-8", "replace")
+            evidence.append(part.get_content_type() + ":" + _inv_hashlib.sha256(data).hexdigest())
+        identity = json.dumps(evidence, ensure_ascii=False).encode("utf-8")
+    else:
+        identity = message.as_bytes(policy=_inv_policy.default)
+    return _inv_hashlib.sha256(address.strip().lower().encode("utf-8") + b"\n" + identity).hexdigest()
+
+
+def _inv_rejected_messages():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_rejections "
+                     "(reference TEXT PRIMARY KEY, mailbox TEXT NOT NULL, rejected_at TEXT NOT NULL)")
+        return {row[0] for row in conn.execute(
+            "SELECT reference FROM invoice_mail_rejections WHERE rejected_at <> ''").fetchall()}
+
+
+def _inv_delivery_digests():
+    with _db_connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_delivery "
+                     "(reference TEXT PRIMARY KEY, created_at TEXT NOT NULL)")
+        return {row[0] for row in conn.execute("SELECT reference FROM invoice_mail_delivery").fetchall()
+                if re.fullmatch(r"[a-f0-9]{64}", row[0])}
+
+
+def _inv_validate_message_key(payload, address, message):
+    actual = _inv_message_key(address, message)
+    expected = payload.get("message_key")
+    if expected is not None:
+        if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+            raise HTTPException(422, "Ongeldige mailidentiteit.")
+        if not _inv_hmac.compare_digest(expected, actual):
+            raise HTTPException(409, "Deze mail is gewijzigd of verplaatst. Scan het postvak opnieuw.")
+    return actual
+
+
+def _inv_assert_mail_active(address, message, payload=None):
+    key = _inv_validate_message_key(payload or {}, address, message)
+    if key in _inv_rejected_messages():
+        raise HTTPException(409, "Deze specifieke mail is niet geaccepteerd en blijft in je postvak staan.")
+    return key
+
+
+def _inv_lock_mail_decision(conn, key, address):
+    """Serialize rejection and send reservations, also across server processes.
+
+    A SQLite INSERT obtains its write lock; PostgreSQL locks this individual
+    source-mail row until the transaction commits. No SMTP/IMAP writes here.
+    """
+    marker = "%s" if _postgres_enabled() else "?"
+    conn.execute(f"INSERT INTO invoice_mail_rejections(reference,mailbox,rejected_at) "
+                 f"VALUES ({marker},{marker},'') ON CONFLICT (reference) DO NOTHING", (key, address))
+    row = conn.execute(f"SELECT rejected_at FROM invoice_mail_rejections WHERE reference={marker}" +
+                       (" FOR UPDATE" if _postgres_enabled() else ""), (key,)).fetchone()
+    return bool(row and row[0])
+
+
 def _inv_trash_folder(imap):
     result, folders = imap.list()
     if result != "OK":
@@ -9673,11 +9751,13 @@ def _inv_quoted_folder(name):
 
 
 def _inv_move_completed_mail(address: str, uid: str, expected_digest: str = ""):
-    # A source message can move only after every PDF was submitted or explicitly dismissed.
+    # A rejected source mail always stays put. All PDFs of other mails must be submitted.
     imap = None
     try:
         imap = _inv_mailbox(address, writable=True)
         message = _inv_fetch(imap, uid)
+        if _inv_message_key(address, message) in _inv_rejected_messages():
+            return False, "Deze mail is niet geaccepteerd en blijft in Postvak IN staan."
         pdfs = list(_inv_attachments(message))
         if not pdfs or _inv_has_unprocessed_pdf_parts(message, pdfs):
             return False, "Deze bronmail bevat een te grote, onleesbare of niet herkende PDF en blijft in Postvak IN."
@@ -9685,9 +9765,8 @@ def _inv_move_completed_mail(address: str, uid: str, expected_digest: str = ""):
         if expected_digest and expected_digest not in actual:
             return False, "De bronmail komt niet meer overeen met de factuur; de mail is niet verplaatst."
         confirmed = _inv_confirmed_digests()
-        dismissed = _inv_dismissed_digests()
         # At least one successfully submitted PDF is required; never delete a merely approved draft.
-        if not actual.intersection(confirmed) or not actual.issubset(confirmed | dismissed):
+        if not actual or not actual.issubset(confirmed):
             return False, "Deze bronmail heeft nog niet afgehandelde PDF-bijlagen en blijft in Postvak IN."
         trash = _inv_trash_folder(imap)
         if not trash:
@@ -9796,6 +9875,7 @@ def invoice_imap_status(request: Request):
     return {"accounts": [{"address": address, "configured": bool(os.environ.get(env))}
                           for address, env in _INV_ADDRESSES.items()], "pdf_reader": _InvPdfReader is not None,
             "forwarding_from": _INV_FORWARD_FROM,
+            "message_rejection_ready": True,
             "forwarding_ready": bool(os.environ.get(_INV_ADDRESSES[_INV_FORWARD_FROM]))}
 
 
@@ -9808,7 +9888,7 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
         raise HTTPException(400, "Onbekend postvak.")
     since = (datetime.now(timezone.utc)-_inv_timedelta(days=30)).strftime("%d-%b-%Y")
     docs, errors = [], []
-    dismissed = _inv_dismissed_digests()
+    rejected_messages = _inv_rejected_messages()
     analysis, fresh_analysis = _inv_analysis_cache(), []
     names, fresh_names = _inv_name_cache(), []
     amounts, fresh_amounts = _inv_amount_cache(), []
@@ -9824,14 +9904,15 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
                     uid = uidbytes.decode("ascii")
                     try: msg = _inv_fetch(imap, uid)
                     except HTTPException: continue
+                    message_key = _inv_message_key(address, msg)
+                    if message_key in rejected_messages:
+                        continue
                     sender = _inv_email_utils.parseaddr(str(msg.get("From", "")))[1].lower()
                     received = str(msg.get("Date", ""))
                     try: received = _inv_parsedate(received).astimezone(timezone.utc).isoformat()
                     except Exception: received = ""
                     for filename, pdf in _inv_attachments(msg):
                         digest = _inv_hashlib.sha256(pdf).hexdigest()
-                        if digest in dismissed:
-                            continue
                         # Toon ook een tweede mailkopie uit het andere postvak.
                         # De verzendregistratie blijft per PDF-digest uniek.
                         analysis_key = _inv_analysis_key(digest, filename) + ":class-v3"
@@ -9869,7 +9950,7 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
                         if visible_name and (source != "PDF-tekst" or kind != "invoice"):
                             visible_name["complete"] = False
                         review = reviews.get(digest, {})
-                        docs.append({"mailbox": address, "uid": uid, "digest": digest,
+                        docs.append({"mailbox": address, "uid": uid, "digest": digest, "message_key": message_key,
                                      "sender": sender, "received": received,
                                      "subject": str(msg.get("Subject", ""))[:200],
                                      "filename": filename[:200], "size": len(pdf),
@@ -9886,39 +9967,55 @@ def invoice_imap_scan(request: Request, mailbox: str = ""):
     _inv_save_names(fresh_names)
     _inv_save_amounts(fresh_amounts)
     confirmed = _inv_confirmed_digests()
+    pending = _inv_delivery_digests() - confirmed
     for doc in docs:
         doc["sent"] = doc["digest"] in confirmed
+        doc["delivery_uncertain"] = doc["digest"] in pending
     return {"documents": docs, "errors": errors,
             "scanned_mailboxes": [mailbox] if mailbox else list(_INV_ADDRESSES)}
 
 
 @app.post("/api/invoice-imap/dismiss")
 def invoice_imap_dismiss(payload: dict, request: Request):
+    """Exclude a specific source mail. Never move, flag, or delete that mail."""
     _inv_authorize(request)
     documents = payload.get("documents")
     if not isinstance(documents, list) or not 1 <= len(documents) <= 100:
-        raise HTTPException(400, "Selecteer maximaal 100 onzekere PDF’s.")
-    confirmed = _inv_confirmed_digests()
-    digests = set()
+        raise HTTPException(400, "Selecteer 1 tot 100 documenten.")
+    groups = {}
+    # Read-only verification of every requested source, before recording anything.
     for item in documents:
         if not isinstance(item, dict):
             raise HTTPException(400, "Ongeldige documentselectie.")
         address, uid, digest = (str(item.get(field, "")) for field in ("mailbox", "uid", "digest"))
-        _, filename, pdf = _inv_document(address, uid, digest)
-        text, source = _inv_pdf_text(pdf)
-        kind, _ = _inv_kind(text, filename, source)
-        if kind not in {"review", "unreadable"} or digest in confirmed:
-            raise HTTPException(409, "Alleen onzekere, nog niet verstuurde PDF’s kunnen als geen factuur worden aangemerkt.")
-        digests.add(digest)
+        message, _, _ = _inv_document(address, uid, digest)
+        key = _inv_validate_message_key(item, address, message)
+        group = groups.setdefault(key, {"mailbox": address, "uid": uid, "message_key": key,
+                                       "requested": set(), "actual": set()})
+        group["requested"].add(digest)
+        group["actual"].update(_inv_hashlib.sha256(pdf).hexdigest() for _, pdf in _inv_attachments(message))
+    _inv_rejected_messages()
+    _inv_confirmed_digests()
+    _inv_delivery_digests()
     with _db_connect() as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_dismissed "
-                     "(reference TEXT PRIMARY KEY, dismissed_at TEXT NOT NULL)")
         marker = "%s" if _postgres_enabled() else "?"
-        for digest in digests:
-            conn.execute(f"INSERT INTO invoice_mail_dismissed (reference, dismissed_at) "
-                         f"VALUES ({marker}, {marker}) ON CONFLICT (reference) DO NOTHING",
-                         (digest, datetime.now(timezone.utc).isoformat()))
-    return {"dismissed": len(digests)}
+        # Fixed ordering avoids deadlocks when two clients select multiple mails.
+        for key in sorted(groups):
+            _inv_lock_mail_decision(conn, key, groups[key]["mailbox"])
+        confirmed = {row[0] for row in conn.execute("SELECT reference FROM invoice_mail_confirmed").fetchall()}
+        delivering = {row[0] for row in conn.execute("SELECT reference FROM invoice_mail_delivery").fetchall()}
+        for group in groups.values():
+            if group["requested"] & confirmed:
+                raise HTTPException(409, "Dit document is al doorgestuurd en blijft onder Doorgestuurd staan.")
+            if group["actual"] & (delivering - confirmed):
+                raise HTTPException(409, "Een verzending uit deze mail loopt nog of is onzeker. Controleer eerst de ontvangst.")
+        now = datetime.now(timezone.utc).isoformat()
+        for key in groups:
+            conn.execute(f"UPDATE invoice_mail_rejections SET rejected_at={marker} "
+                         f"WHERE reference={marker}", (now, key))
+    return {"dismissed": len(groups), "mailbox_unchanged": True, "scope": "message",
+            "messages": [{key: group[key] for key in ("mailbox", "uid", "message_key")}
+                         for group in groups.values()]}
 
 
 @app.post("/api/invoice-imap/trash")
@@ -10006,6 +10103,8 @@ def invoice_imap_send(payload: dict, request: Request):
         raise HTTPException(409, "Deze PDF is nog niet eerder doorgestuurd.")
     original, filename, pdf = (_inv_resend_document if repeat else _inv_document)(
         str(payload.get("mailbox", "")), str(payload.get("uid", "")), digest)
+    source_address = str(payload.get("mailbox", ""))
+    message_key = _inv_assert_mail_active(source_address, original, payload)
     text, source = _inv_pdf_text(pdf)
     kind, _ = _inv_kind(text, filename, source)
     if source == "versleuteld":
@@ -10013,8 +10112,10 @@ def invoice_imap_send(payload: dict, request: Request):
     cfg = _inv_smtp_settings()
     # Reserveer vóór het verzenden: bij een timeout kan SMTP al afgeleverd hebben.
     reference = digest + (":repeat:" + repeat_id if repeat else "")
+    _inv_delivery_digests()
     with _db_connect() as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS invoice_mail_delivery (reference TEXT PRIMARY KEY, created_at TEXT NOT NULL)")
+        if _inv_lock_mail_decision(conn, message_key, source_address):
+            raise HTTPException(409, "Deze mail is niet geaccepteerd en wordt niet doorgestuurd.")
         marker = "%s" if _postgres_enabled() else "?"
         result = conn.execute(f"INSERT INTO invoice_mail_delivery (reference, created_at) VALUES ({marker}, {marker}) ON CONFLICT (reference) DO NOTHING",
                               (reference, datetime.now(timezone.utc).isoformat()))
