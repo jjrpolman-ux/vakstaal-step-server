@@ -1186,6 +1186,25 @@ def _is_standard_profile_edge(edge: cq.Shape,basis: tuple)->bool:
             mx=float((a[0]+b[0])/2.0)
             my=float((a[1]+b[1])/2.0)
             if _near_profile_anchor(mx,my,basis,1.35):
+                # v1216 — korte axiale stukjes vlak bij een fysiek buiseinde zijn
+                # niet automatisch een gewone profielnaad. Bij STEP-einden met
+                # een lokaal verspringende/afgeronde contour (zoals 25x25x1,5
+                # in het Kastframe-bestand) zijn deze korte lijnstukken juist
+                # onderdeel van het echte laser-eindpad. De oude herkenning
+                # verwijderde ze, waarna de frontend een kunstmatige 1 mm-kloof
+                # in een verder geldige eindcontour zag.
+                #
+                # Lange langsranden blijven gewoon als standaard profielnaad
+                # onderdrukt. Alleen een KORT stukje binnen de terminale zone
+                # wordt behouden; de buitenhuidfilter beslist daarna nog steeds
+                # of het werkelijk tot de fysieke buitencontour behoort.
+                half_len=float(basis[6])
+                ow=float(basis[4]); oh=float(basis[5])
+                terminal_band=max(1.5,min(8.0,max(ow,oh,1.0)*0.18))
+                near_terminal=max(abs(float(a[2])),abs(float(b[2]))) >= half_len-terminal_band
+                short_terminal_edge=chord <= max(1.25,terminal_band*0.55)
+                if near_terminal and short_terminal_edge:
+                    return False
                 return True
         return False
 
